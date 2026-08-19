@@ -1,6 +1,6 @@
 {
 	"name": "cognitree",
-	"version": "1.1.0",
+	"version": "1.1.1",
 	"description": "AI-powered branching knowledge trees for Obsidian — type one concept and grow it into a deep, interconnected network of notes.",
 	"main": "main.js",
 	"scripts": {

@@ -1,8 +1,8 @@
 {
 	"id": "cognitree",
 	"name": "CogniTree",
-	"version": "1.1.0",
-	"minAppVersion": "1.4.0",
+	"version": "1.1.1",
+	"minAppVersion": "1.6.6",
 	"description": "AI-powered branching knowledge trees. Grow a concept into tens of thousands of interconnected notes with a polymathic taxonomist LLM.",
 	"author": "CogniTree",
 	"authorUrl": "",

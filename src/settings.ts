@@ -19,7 +19,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		const s = this.plugin.settings;
 
-		new Setting(containerEl).setName('CogniTree — Settings').setHeading();
+		new Setting(containerEl).setName('Configuration').setHeading();
 
 		// ---------------------------------------------------------- API
 		new Setting(containerEl).setName('API Configuration').setHeading();
@@ -175,7 +175,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			);
 
 		// ------------------------------------------------------- Generation
-		new Setting(containerEl).setName('Generation Settings').setHeading();
+		new Setting(containerEl).setName('Generation').setHeading();
 
 		new Setting(containerEl)
 			.setName('Max children per level')
@@ -226,7 +226,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			);
 
 		// ------------------------------------------------------------- UI
-		new Setting(containerEl).setName('UI Settings').setHeading();
+		new Setting(containerEl).setName('UI').setHeading();
 
 		new Setting(containerEl)
 			.setName('Auto-expand depth')
