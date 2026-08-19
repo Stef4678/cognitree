@@ -302,7 +302,7 @@ export class ApiClient {
 		// chunks so the browser can paint the status updates.
 		for (const d of deltas) {
 			onDelta(d);
-			await new Promise((resolve) => setTimeout(resolve, 0));
+			await new Promise((resolve) => window.setTimeout(resolve, 0));
 		}
 		return full;
 	}
