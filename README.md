@@ -148,9 +148,9 @@ Click any node once to grab keyboard focus for the list. The toolbar actions (**
 
 ## Commands
 
-- **Open CogniTree panel**
+- **Open panel**
 - **Create concept tree from selection** — uses the current editor selection as the root concept
-- **Refresh CogniTree from vault** — reload trees if you edited notes by hand
+- **Refresh from vault** — reload trees if you edited notes by hand
 - **Reindex vault notes** — rebuild the connection index on demand
 
 ## Screenshots

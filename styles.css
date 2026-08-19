@@ -762,12 +762,29 @@ body.theme-light {
 }
 
 @media (prefers-reduced-motion: reduce) {
-	.ct-logo, .ct-empty-orb, .ct-status-text::before,
-	.ct-progress-bar, .ct-spinner, .ct-caret, .ct-icon-btn,
-	.ct-btn, .ct-suggest-chip, .ct-row::before, .ct-actions {
-		animation: none !important;
-		transition: none !important;
+	.ct-root .ct-logo, .ct-root .ct-empty-orb, .ct-root .ct-status-text::before,
+	.ct-root .ct-progress-bar, .ct-root .ct-spinner, .ct-root .ct-caret,
+	.ct-root .ct-icon-btn, .ct-root .ct-btn, .ct-root .ct-suggest-chip,
+	.ct-root .ct-row::before, .ct-root .ct-actions {
+		animation: none;
+		transition: none;
 	}
+}
+
+/* ------------------------------ visibility utilities ------------------------------ */
+
+/* Later than .ct-empty / .ct-viewport / .ct-custom-row, so it wins at equal
+   specificity — used instead of inline style.display assignments. */
+.ct-hidden {
+	display: none;
+}
+
+.ct-tooltip.ct-visible {
+	display: block;
+}
+
+.ct-no-match.ct-visible {
+	display: flex;
 }
 
 /* ------------------------------ modals ------------------------------ */

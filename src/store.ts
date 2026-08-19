@@ -404,7 +404,7 @@ export class ConceptStore {
 			d.file = newFile;
 			await this.app.vault.create(newFile, this.noteContent(d));
 			const old = this.app.vault.getAbstractFileByPath(oldFile);
-			if (old instanceof TFile) await this.app.vault.delete(old);
+			if (old instanceof TFile) await this.app.fileManager.trashFile(old);
 			moved.push(d);
 		}
 
@@ -431,7 +431,7 @@ export class ConceptStore {
 			}
 		}
 		const dupFile = this.app.vault.getAbstractFileByPath(node.file);
-		if (dupFile instanceof TFile) await this.app.vault.delete(dupFile);
+		if (dupFile instanceof TFile) await this.app.fileManager.trashFile(dupFile);
 
 		return { moved: moved.length, skipped };
 	}
@@ -456,7 +456,9 @@ export class ConceptStore {
 		for (const node of nodes) {
 			const file = this.app.vault.getAbstractFileByPath(node.file);
 			if (file instanceof TFile) {
-				await this.app.vault.delete(file, true);
+				// Trash (respecting the user's deletion preference) instead of
+				// hard-deleting — pairs with the view's Undo button.
+				await this.app.fileManager.trashFile(file);
 			}
 		}
 		if (parent) {
@@ -519,7 +521,8 @@ export class ConceptStore {
 		};
 		const content = this.noteContent(node);
 		await this.app.vault.create(file, content);
-		return this.app.vault.getAbstractFileByPath(file) as TFile;
+		const created = this.app.vault.getAbstractFileByPath(file);
+		return created instanceof TFile ? created : null;
 	}
 }
 

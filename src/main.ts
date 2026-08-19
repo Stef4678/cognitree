@@ -23,7 +23,12 @@ export default class CogniTreePlugin extends Plugin {
 	indexer!: VaultIndexer;
 	generator!: ConceptGenerator;
 	cache!: ResponseCache;
-	treeView: ConceptTreeView | null = null;
+
+	/** Live reference to the open tree view (no instance stored on the plugin). */
+	get treeView(): ConceptTreeView | null {
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+		return leaves.length > 0 ? (leaves[0].view as ConceptTreeView) : null;
+	}
 
 	async onload(): Promise<void> {
 		await this.loadAll();
@@ -46,11 +51,9 @@ export default class CogniTreePlugin extends Plugin {
 			this.cache
 		);
 
-		// View
-		this.registerView(VIEW_TYPE, (leaf) => {
-			this.treeView = new ConceptTreeView(leaf, this);
-			return this.treeView;
-		});
+		// View — return the view directly; never store it on the plugin
+		// (a stored instance keeps the leaf alive and leaks memory).
+		this.registerView(VIEW_TYPE, (leaf) => new ConceptTreeView(leaf, this));
 
 		// Ribbon
 		this.addRibbonIcon('network', 'Open CogniTree', () => {
@@ -59,8 +62,8 @@ export default class CogniTreePlugin extends Plugin {
 
 		// Commands
 		this.addCommand({
-			id: 'open-cognitree',
-			name: 'Open CogniTree panel',
+			id: 'open-panel',
+			name: 'Open panel',
 			callback: () => void this.activateView(),
 		});
 		this.addCommand({
@@ -84,7 +87,7 @@ export default class CogniTreePlugin extends Plugin {
 		});
 		this.addCommand({
 			id: 'refresh-trees',
-			name: 'Refresh CogniTree from vault',
+			name: 'Refresh from vault',
 			callback: () => void this.treeView?.refreshAll(),
 		});
 		this.addCommand({
@@ -101,10 +104,6 @@ export default class CogniTreePlugin extends Plugin {
 				void this.activateView(false);
 			}
 		});
-	}
-
-	onunload(): void {
-		this.app.workspace.detachLeavesOfType(VIEW_TYPE);
 	}
 
 	// ------------------------------------------------------------------ data
@@ -161,19 +160,22 @@ export default class CogniTreePlugin extends Plugin {
 	async activateView(focus = true): Promise<void> {
 		const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE);
 		if (existing.length > 0) {
-			if (focus) this.app.workspace.revealLeaf(existing[0]);
+			if (focus) this.app.workspace.setActiveLeaf(existing[0], { focus: true });
 			return;
 		}
 		const leaf = this.app.workspace.getRightLeaf(false);
 		if (!leaf) return;
 		await leaf.setViewState({ type: VIEW_TYPE, active: focus });
-		if (focus) this.app.workspace.revealLeaf(leaf);
+		if (focus) this.app.workspace.setActiveLeaf(leaf, { focus: true });
 	}
 
 	async openSettings(): Promise<void> {
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(this.app as any).setting.open();
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		(this.app as any).setting.openTabById('cognitree');
+		// `app.setting` is not part of the public typings; access it through a
+		// narrow structural cast so no `any` or eslint-disable is needed.
+		const setting = (
+			this.app as unknown as { setting: { open(): void; openTabById(id: string): void } }
+		).setting;
+		setting.open();
+		setting.openTabById('cognitree');
 	}
 }

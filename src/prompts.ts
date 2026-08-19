@@ -1,4 +1,4 @@
-import type { ChildConcept, Complexity } from './types';
+import type { Complexity } from './types';
 
 /**
  * The two-tier prompt system:

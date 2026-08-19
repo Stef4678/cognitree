@@ -23,15 +23,15 @@ export function extractJSON<T = unknown>(text: string): T | null {
 
 	const attempts: (() => unknown)[] = [
 		// 1. Direct parse.
-		() => JSON.parse(s),
+		(): unknown => JSON.parse(s),
 		// 2. Tolerate trailing commas (a very common LLM slip).
-		() => JSON.parse(s.replace(/,\s*([}\]])/g, '$1')),
+		(): unknown => JSON.parse(s.replace(/,\s*([}\]])/g, '$1')),
 		// 3. Insert missing "{ }" braces around object entries emitted
 		//    directly inside arrays (the "energy" failure mode), then repair.
-		() => JSON.parse(jsonrepair(repairMissingBraces(s))),
+		(): unknown => JSON.parse(jsonrepair(repairMissingBraces(s))),
 		// 4. Full repair — unquoted keys, single quotes, multiline strings,
 		//    missing commas, truncated tails, …
-		() => JSON.parse(jsonrepair(s)),
+		(): unknown => JSON.parse(jsonrepair(s)),
 	];
 
 	for (const attempt of attempts) {
@@ -248,7 +248,8 @@ export function slugify(s: string): string {
 export function sanitizeFileName(s: string): string {
 	let out = (s || '')
 		.trim()
-		.replace(/[<>:"/\\|?*\u0000-\u001f]/g, ' ')
+		.replace(/[<>:"/\\|?*]/g, ' ')
+		.replace(/\p{Cc}/gu, ' ')
 		.replace(/\s+/g, ' ')
 		.trim()
 		.replace(/[. ]+$/g, '');

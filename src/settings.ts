@@ -19,10 +19,10 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 		containerEl.empty();
 		const s = this.plugin.settings;
 
-		containerEl.createEl('h2', { text: 'CogniTree — Settings' });
+		new Setting(containerEl).setName('CogniTree — Settings').setHeading();
 
 		// ---------------------------------------------------------- API
-		containerEl.createEl('h3', { text: 'API Configuration' });
+		new Setting(containerEl).setName('API Configuration').setHeading();
 
 		new Setting(containerEl)
 			.setName('API key')
@@ -85,10 +85,10 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 				dd.setValue(isKnown ? s.model : '__custom__');
 				dd.onChange(async (v) => {
 					if (v === '__custom__') {
-						customRow.style.display = 'block';
+						customRow.toggleClass('ct-hidden', false);
 						if (customInput) customInput.inputEl.focus();
 					} else {
-						customRow.style.display = 'none';
+						customRow.toggleClass('ct-hidden', true);
 						s.model = v;
 						await this.plugin.saveSettings();
 						this.plugin.treeView?.syncModelSelect();
@@ -117,7 +117,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 		];
 		const isKnownModel = knownForCustom.includes(s.model);
 		const customRow = containerEl.createDiv({ cls: 'ct-custom-row' });
-		customRow.style.display = isKnownModel ? 'none' : 'block';
+		customRow.toggleClass('ct-hidden', isKnownModel);
 		new Setting(customRow)
 			.setName('Custom model id')
 			.setDesc('Used when “Custom…” is selected above.')
@@ -142,7 +142,6 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 				sl
 					.setLimits(0, 1, 0.05)
 					.setValue(s.temperature)
-					.setDynamicTooltip()
 					.onChange(async (v) => {
 						s.temperature = v;
 						await this.plugin.saveSettings();
@@ -176,7 +175,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			);
 
 		// ------------------------------------------------------- Generation
-		containerEl.createEl('h3', { text: 'Generation Settings' });
+		new Setting(containerEl).setName('Generation Settings').setHeading();
 
 		new Setting(containerEl)
 			.setName('Max children per level')
@@ -227,7 +226,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			);
 
 		// ------------------------------------------------------------- UI
-		containerEl.createEl('h3', { text: 'UI Settings' });
+		new Setting(containerEl).setName('UI Settings').setHeading();
 
 		new Setting(containerEl)
 			.setName('Auto-expand depth')
@@ -268,7 +267,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			);
 
 		// ------------------------------------------------------- Performance
-		containerEl.createEl('h3', { text: 'Performance & Storage' });
+		new Setting(containerEl).setName('Performance & Storage').setHeading();
 
 		new Setting(containerEl)
 			.setName('Cache expiry (hours)')
@@ -301,7 +300,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			);
 
 		// ----------------------------------------------------------- Actions
-		containerEl.createEl('h3', { text: 'Data' });
+		new Setting(containerEl).setName('Data').setHeading();
 
 		new Setting(containerEl)
 			.setName('Clear response cache')

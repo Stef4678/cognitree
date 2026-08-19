@@ -38,7 +38,7 @@ export class ResponseCache {
 		}
 	}
 
-	async get(kind: string, promptUser: string, model: string): Promise<unknown | null> {
+	async get(kind: string, promptUser: string, model: string): Promise<unknown> {
 		const hours = Math.max(0, this.getSettings().cacheExpiryHours);
 		if (hours === 0) return null; // caching disabled
 		const key = this.makeKey(kind, promptUser, model);

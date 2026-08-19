@@ -1,4 +1,4 @@
-import { Notice } from 'obsidian';
+import { Notice, requestUrl } from 'obsidian';
 import { providerFor, type PluginSettings } from './types';
 
 export interface ChatMessage {
@@ -72,11 +72,14 @@ export class ApiClient {
 		if (base.endsWith('/chat/completions')) base = base.replace(/\/chat\/completions$/, '');
 		const url = base.endsWith('/models') ? base : `${base}/models`;
 		try {
-			const res = await fetch(url, {
+			const res = await requestUrl({
+				url,
+				method: 'GET',
 				headers: { Authorization: `Bearer ${apiKey}` },
+				throw: false,
 			});
-			if (!res.ok) return [];
-			const data = (await res.json()) as { data?: { id?: string }[] };
+			if (res.status !== 200) return [];
+			const data = res.json as { data?: { id?: string }[] };
 			const ids = (data?.data ?? [])
 				.map((m) => (m?.id ? String(m.id) : ''))
 				.filter(Boolean)
@@ -207,7 +210,7 @@ export class ApiClient {
 				}[];
 			};
 			try {
-				json = JSON.parse(payload);
+				json = JSON.parse(payload) as typeof json;
 			} catch {
 				return; // malformed keepalive — ignore
 			}

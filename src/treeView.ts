@@ -259,9 +259,8 @@ export class ConceptTreeView extends ItemView {
 		this.scrollEl.addEventListener('keydown', (e) => this.onScrollKeydown(e));
 		this.viewportEl = this.scrollEl.createDiv({ cls: 'ct-viewport' });
 		this.emptyEl = this.scrollEl.createDiv({ cls: 'ct-empty' });
-		this.emptyEl.style.display = 'none';
+		this.emptyEl.addClass('ct-hidden');
 		this.noMatchEl = this.scrollEl.createDiv({ cls: 'ct-no-match' });
-		this.noMatchEl.style.display = 'none';
 		this.buildEmptyState();
 		this.scrollEl.addEventListener('scroll', () => {
 			this.scrollTop = this.scrollEl.scrollTop;
@@ -277,7 +276,7 @@ export class ConceptTreeView extends ItemView {
 		this.statusTextEl = status.createSpan({ cls: 'ct-status-text' });
 		this.progressEl = status.createDiv({ cls: 'ct-progress' });
 		this.progressBarEl = this.progressEl.createDiv({ cls: 'ct-progress-bar' });
-		this.progressEl.style.display = 'none';
+		this.progressEl.addClass('ct-hidden');
 	}
 
 	/** Empty-state hero with clickable example concepts. */
@@ -453,7 +452,7 @@ export class ConceptTreeView extends ItemView {
 				(d) => this.setBusy(true, `Expanding "${name}"… ${d.slice(-40)}`)
 			);
 			for (const child of created) {
-				this.model!.nodes.set(child.name, child);
+				this.model.nodes.set(child.name, child);
 			}
 			node.expanded = true;
 			new Notice(
@@ -522,9 +521,9 @@ export class ConceptTreeView extends ItemView {
 				rootName: this.model.root,
 				nodeName: node.name,
 			},
-			async (opts) => {
+			(opts) => {
 				modal.close();
-				await this.runBatch(node.name, opts.depth, opts.budget);
+				void this.runBatch(node.name, opts.depth, opts.budget);
 			}
 		);
 		modal.open();
@@ -808,15 +807,15 @@ export class ConceptTreeView extends ItemView {
 
 	render(): void {
 		if (!this.model) {
-			this.emptyEl.style.display = 'flex';
-			this.viewportEl.style.display = 'none';
-			this.noMatchEl.style.display = 'none';
+			this.emptyEl.toggleClass('ct-hidden', false);
+			this.viewportEl.toggleClass('ct-hidden', true);
+			this.noMatchEl.toggleClass('ct-visible', false);
 			this.rows = [];
 			this.updateStats();
 			return;
 		}
-		this.emptyEl.style.display = 'none';
-		this.viewportEl.style.display = 'block';
+		this.emptyEl.toggleClass('ct-hidden', true);
+		this.viewportEl.toggleClass('ct-hidden', false);
 		this.flatten();
 		// New filter query: jump straight to the first matching row.
 		if (this.jumpToFirstMatch) {
@@ -828,9 +827,9 @@ export class ConceptTreeView extends ItemView {
 			}
 		}
 		// "No matches" hint instead of a blank area.
-		this.noMatchEl.style.display =
-			this.filter && this.rows.length === 0 ? 'flex' : 'none';
-		if (this.filter && this.rows.length === 0) {
+		const showNoMatch = this.filter.length > 0 && this.rows.length === 0;
+		this.noMatchEl.toggleClass('ct-visible', showNoMatch);
+		if (showNoMatch) {
 			this.noMatchEl.empty();
 			this.noMatchEl.createEl('b', { text: 'No matching nodes' });
 			this.noMatchEl.createSpan({ text: `No concept in this tree contains "${this.filter}".` });
@@ -878,7 +877,7 @@ export class ConceptTreeView extends ItemView {
 	private schedulePaint(): void {
 		if (this.rafPending) return;
 		this.rafPending = true;
-		this.rafTimer = requestAnimationFrame(() => {
+		this.rafTimer = window.requestAnimationFrame(() => {
 			this.rafPending = false;
 			this.paint();
 		});
@@ -894,7 +893,7 @@ export class ConceptTreeView extends ItemView {
 			start = Math.max(0, Math.floor(this.scrollTop / ROW_H) - 8);
 			end = Math.min(total, Math.ceil((this.scrollTop + vh) / ROW_H) + 8);
 		}
-		const frag = document.createDocumentFragment();
+		const frag = createFragment();
 		this.rowEls.clear();
 		for (let i = start; i < end; i++) {
 			frag.appendChild(this.buildRow(i));
@@ -1034,8 +1033,8 @@ export class ConceptTreeView extends ItemView {
 
 	private setBusy(on: boolean, text?: string): void {
 		if (on && text) this.setStatus(text);
-		this.progressEl.style.display = on ? 'block' : 'none';
-		if (!on) this.progressBarEl.style.width = '0%';
+		this.progressEl.toggleClass('ct-hidden', !on);
+		if (!on) this.progressBarEl.style.removeProperty('width');
 	}
 
 	private setProgress(done: number, total: number): void {
@@ -1071,7 +1070,7 @@ export class ConceptTreeView extends ItemView {
 				? node.description.slice(0, 300) + '…'
 				: node.description;
 		tip.createDiv({ cls: 'ct-tooltip-desc', text: text });
-		tip.style.display = 'block';
+		tip.toggleClass('ct-visible', true);
 		const rect = anchor.getBoundingClientRect();
 		const tw = tip.offsetWidth;
 		const th = tip.offsetHeight;
@@ -1085,7 +1084,7 @@ export class ConceptTreeView extends ItemView {
 	}
 
 	private hideTooltip(): void {
-		if (this.tooltipEl) this.tooltipEl.style.display = 'none';
+		if (this.tooltipEl) this.tooltipEl.toggleClass('ct-visible', false);
 	}
 
 	// ------------------------------------------------------------- keyboard nav
@@ -1173,28 +1172,12 @@ export class ConceptTreeView extends ItemView {
 	// ------------------------------------------------------------- clipboard
 
 	private copyToClipboard(text: string, label: string): void {
-		const done = () => new Notice(`${label} copied.`);
-		if (navigator.clipboard && navigator.clipboard.writeText) {
-			void navigator.clipboard.writeText(text).then(done, () => this.legacyCopy(text, done));
-		} else {
-			this.legacyCopy(text, done);
-		}
-	}
-
-	private legacyCopy(text: string, done: () => void): void {
-		const ta = document.createElement('textarea');
-		ta.value = text;
-		ta.style.position = 'fixed';
-		ta.style.opacity = '0';
-		document.body.appendChild(ta);
-		ta.select();
-		try {
-			document.execCommand('copy');
-		} catch {
-			// Clipboard unavailable — the notice still fires.
-		}
-		ta.remove();
-		done();
+		// Obsidian runs on Electron, where the async Clipboard API is always
+		// available; the deprecated execCommand fallback is intentionally not used.
+		void navigator.clipboard.writeText(text).then(
+			() => new Notice(`${label} copied.`),
+			() => new Notice(`Could not copy ${label}.`, 4000)
+		);
 	}
 
 	// ------------------------------------------------------------- batch connections
@@ -1321,7 +1304,6 @@ class BatchModal extends Modal {
 				sl
 					.setLimits(1, 10, 1)
 					.setValue(depth)
-					.setDynamicTooltip()
 					.onChange((v) => (depth = v))
 			);
 		new Setting(contentEl)
