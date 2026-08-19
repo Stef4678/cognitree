@@ -153,6 +153,18 @@ Click any node once to grab keyboard focus for the list. The toolbar actions (**
 - **Refresh CogniTree from vault** — reload trees if you edited notes by hand
 - **Reindex vault notes** — rebuild the connection index on demand
 
+## Screenshots
+
+![CogniTree view 1](assets/screenshot-1.png)
+
+![CogniTree view 2](assets/screenshot-2.png)
+
+![CogniTree view 3](assets/screenshot-3.png)
+
+![CogniTree view 4](assets/screenshot-4.png)
+
+![CogniTree view 5](assets/screenshot-5.png)
+
 ## License
 
 MIT © 2026 Kerekes Stefan
