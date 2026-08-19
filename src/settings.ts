@@ -1,4 +1,11 @@
-import { Notice, PluginSettingTab, Setting, type TextComponent } from 'obsidian';
+import {
+	Notice,
+	PluginSettingTab,
+	Setting,
+	type SettingDefinitionItem,
+	type SettingDefinitionRender,
+	type TextComponent,
+} from 'obsidian';
 import type CogniTreePlugin from './main';
 import { PROVIDERS, curatedModelsFor, providerFor } from './types';
 
@@ -8,78 +15,194 @@ import { PROVIDERS, curatedModelsFor, providerFor } from './types';
  *  - Generation: maxChildrenPerLevel, maxDepth, maxNodesPerBatch
  *  - UI: autoExpandDepth, showComplexity, virtualizeRendering
  *  - Performance: cacheExpiryHours
+ *
+ * Dual-implementation (Obsidian docs "Migrate to declarative settings", Path B):
+ *  - Obsidian >= 1.13 renders from `getSettingDefinitions()` and skips `display()`.
+ *  - Older versions run `display()`. Both paths share the same row builders,
+ *    so there is a single source of truth for the UI.
  */
 export class CogniTreeSettingTab extends PluginSettingTab {
 	constructor(private plugin: CogniTreePlugin) {
 		super(plugin.app, plugin);
 	}
 
+	// ------------------------------------------------------------ legacy path
+
+	/** Imperative rendering — used on Obsidian < 1.13. */
 	display(): void {
 		const { containerEl } = this;
 		containerEl.empty();
-		const s = this.plugin.settings;
+		this.buildAll(containerEl);
+	}
 
-		new Setting(containerEl).setName('Configuration').setHeading();
+	// ------------------------------------------------------- declarative path
 
-		// ---------------------------------------------------------- API
-		new Setting(containerEl).setName('API Configuration').setHeading();
+	/** Declarative definitions — used on Obsidian >= 1.13 (display() is skipped). */
+	getSettingDefinitions(): SettingDefinitionItem[] {
+		const def = (
+			name: string,
+			desc: string,
+			build: (setting: Setting) => void
+		): SettingDefinitionRender => ({
+			name,
+			desc,
+			render: (setting) => build(setting),
+		});
+		return [
+			{
+				type: 'group',
+				heading: 'Configuration',
+				items: [
+					def('API key', 'Key for your OpenAI-compatible endpoint. Not required for local providers (Ollama, LM Studio).', (s) => this.buildApiKeyRow(s)),
+					def('Provider', 'Preset endpoint for a popular OpenAI-compatible provider. Pick Custom… to use your own endpoint.', (s) => this.buildProviderRow(s)),
+					def('Model endpoint', 'Base URL of an OpenAI-compatible chat API (set automatically by the provider presets).', (s) => this.buildEndpointRow(s)),
+					def('Model', 'Models for the selected provider (curated + fetched via GET /models). Choose “Custom…” to type any id.', (s) => this.buildModelRow(s)),
+					def('Temperature', 'Sampling temperature for generation (0 = deterministic, 1 = creative).', (s) => this.buildTemperatureRow(s)),
+					def('Streaming responses', 'Show live streaming text during generation. Disable for simpler debugging.', (s) => this.buildStreamingRow(s)),
+					def('Max tokens per request', 'Token cap for a single generation call. Default: 4000. Raise it if reasoning models keep hitting the limit.', (s) => this.buildMaxTokensRow(s)),
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Generation',
+				items: [
+					def('Max children per level', 'Cap on children generated per expansion. Default: 7.', (s) => this.buildMaxChildrenRow(s)),
+					def('Max depth', 'Deepest level the plugin will auto-expand to. Default: 10.', (s) => this.buildMaxDepthRow(s)),
+					def('Max nodes per batch', 'Node budget for a single batch expansion. Default: 100.', (s) => this.buildMaxNodesRow(s)),
+				],
+			},
+			{
+				type: 'group',
+				heading: 'UI',
+				items: [
+					def('Auto-expand depth', 'Levels expanded automatically when a tree opens (no API calls). Default: 1.', (s) => this.buildAutoExpandRow(s)),
+					def('Show complexity badges', 'Display Beginner/Intermediate/Advanced indicators in the tree.', (s) => this.buildComplexityRow(s)),
+					def('Virtualize rendering', 'Only render the rows visible in the viewport. Recommended for tens of thousands of nodes.', (s) => this.buildVirtualizeRow(s)),
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Performance & Storage',
+				items: [
+					def('Cache expiry (hours)', 'How long generated results are cached. Set 0 to disable caching. Default: 24.', (s) => this.buildCacheExpiryRow(s)),
+					def('Tree folder', 'Vault folder that stores generated concept trees.', (s) => this.buildTreeFolderRow(s)),
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Data',
+				items: [
+					def('Clear response cache', `Currently ${this.plugin.cache?.size ?? 0} cached generations. Cached results reduce API cost.`, (s) => this.buildClearCacheRow(s)),
+				],
+			},
+		];
+	}
 
-		new Setting(containerEl)
+	/** Re-render on both rendering paths (display for < 1.13, update for >= 1.13). */
+	private refresh(): void {
+		this.display();
+		this.update?.();
+	}
+
+	// -------------------------------------------------------------- builders
+
+	private buildAll(container: HTMLElement): void {
+		new Setting(container).setName('Configuration').setHeading();
+		this.buildApiKeyRow(new Setting(container));
+		this.buildProviderRow(new Setting(container));
+		this.buildEndpointRow(new Setting(container));
+		this.buildModelRow(new Setting(container));
+		this.buildTemperatureRow(new Setting(container));
+		this.buildStreamingRow(new Setting(container));
+		this.buildMaxTokensRow(new Setting(container));
+
+		new Setting(container).setName('Generation').setHeading();
+		this.buildMaxChildrenRow(new Setting(container));
+		this.buildMaxDepthRow(new Setting(container));
+		this.buildMaxNodesRow(new Setting(container));
+
+		new Setting(container).setName('UI').setHeading();
+		this.buildAutoExpandRow(new Setting(container));
+		this.buildComplexityRow(new Setting(container));
+		this.buildVirtualizeRow(new Setting(container));
+
+		new Setting(container).setName('Performance & Storage').setHeading();
+		this.buildCacheExpiryRow(new Setting(container));
+		this.buildTreeFolderRow(new Setting(container));
+
+		new Setting(container).setName('Data').setHeading();
+		this.buildClearCacheRow(new Setting(container));
+	}
+
+	private buildApiKeyRow(setting: Setting): void {
+		setting
 			.setName('API key')
 			.setDesc('Key for your OpenAI-compatible endpoint. Not required for local providers (Ollama, LM Studio).')
 			.addText((t) =>
 				t
 					.setPlaceholder('sk-…')
-					.setValue(s.apiKey)
+					.setValue(this.plugin.settings.apiKey)
 					.onChange(async (v) => {
-						s.apiKey = v.trim();
+						this.plugin.settings.apiKey = v.trim();
 						await this.plugin.saveSettings();
 					})
 			)
-			.then((setting) => {
-				(setting.components[0] as unknown as { inputEl: HTMLInputElement }).inputEl.type =
+			.then((s) => {
+				(s.components[0] as unknown as { inputEl: HTMLInputElement }).inputEl.type =
 					'password';
 			});
+	}
 
-		new Setting(containerEl)
+	private buildProviderRow(setting: Setting): void {
+		setting
 			.setName('Provider')
 			.setDesc('Preset endpoint for a popular OpenAI-compatible provider. Pick Custom… to use your own endpoint.')
 			.addDropdown((dd) => {
 				dd.addOption('__custom__', 'Custom…');
 				for (const p of PROVIDERS) dd.addOption(p.id, p.name);
-				const prov = providerFor(s.modelEndpoint);
+				const prov = providerFor(this.plugin.settings.modelEndpoint);
 				dd.setValue(prov ? prov.id : '__custom__');
 				dd.onChange(async (v) => {
 					if (v === '__custom__') return; // keep current endpoint as-is
 					await this.plugin.applyProvider(v);
-					this.display();
+					this.refresh();
 				});
 			});
+	}
 
-		new Setting(containerEl)
+	private buildEndpointRow(setting: Setting): void {
+		setting
 			.setName('Model endpoint')
 			.setDesc('Base URL of an OpenAI-compatible chat API (set automatically by the provider presets).')
 			.addText((t) =>
 				t
 					.setPlaceholder('https://api.deepseek.com')
-					.setValue(s.modelEndpoint)
+					.setValue(this.plugin.settings.modelEndpoint)
 					.onChange(async (v) => {
-						s.modelEndpoint = v.trim();
+						this.plugin.settings.modelEndpoint = v.trim();
 						await this.plugin.saveSettings();
 						this.plugin.treeView?.syncProviderSelect();
 						this.plugin.treeView?.syncModelSelect();
 					})
 			);
+	}
 
-		new Setting(containerEl)
+	private buildModelRow(setting: Setting): void {
+		const s = this.plugin.settings;
+		let customInput: TextComponent | null = null;
+		const known = [
+			...new Set([...curatedModelsFor(s.modelEndpoint), ...(this.plugin.data.models ?? [])]),
+		];
+		const isKnown = known.includes(s.model);
+		// The custom-model row is appended right below the model setting.
+		const container = setting.settingEl.parentElement ?? setting.settingEl;
+
+		setting
 			.setName('Model')
 			.setDesc(
 				'Models for the selected provider (curated + fetched via GET /models). Choose “Custom…” to type any id.'
 			)
 			.addDropdown((dd) => {
-				const curated = curatedModelsFor(s.modelEndpoint);
-				const known = [...new Set([...curated, ...(this.plugin.data.models ?? [])])];
-				const isKnown = known.includes(s.model);
 				for (const m of known) dd.addOption(m, m);
 				dd.addOption('__custom__', 'Custom…');
 				dd.setValue(isKnown ? s.model : '__custom__');
@@ -106,18 +229,13 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 								? `Found ${ids.length} models on this endpoint.`
 								: 'Could not fetch models — the endpoint may not expose GET /models (e.g. Ollama). Custom ids still work.'
 						);
-						this.display();
+						this.refresh();
 					})
 			);
 
 		// Custom model id (visible when “Custom…” is selected)
-		let customInput: TextComponent | null = null;
-		const knownForCustom = [
-			...new Set([...curatedModelsFor(s.modelEndpoint), ...(this.plugin.data.models ?? [])]),
-		];
-		const isKnownModel = knownForCustom.includes(s.model);
-		const customRow = containerEl.createDiv({ cls: 'ct-custom-row' });
-		customRow.toggleClass('ct-hidden', isKnownModel);
+		const customRow = container.createDiv({ cls: 'ct-custom-row' });
+		customRow.toggleClass('ct-hidden', isKnown);
 		new Setting(customRow)
 			.setName('Custom model id')
 			.setDesc('Used when “Custom…” is selected above.')
@@ -125,7 +243,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 				customInput = t;
 				t
 					.setPlaceholder('my-model-id')
-					.setValue(isKnownModel ? '' : s.model);
+					.setValue(isKnown ? '' : s.model);
 				t.onChange(async (v) => {
 					if (v.trim()) {
 						s.model = v.trim();
@@ -134,175 +252,185 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 					}
 				});
 			});
+	}
 
-		new Setting(containerEl)
+	private buildTemperatureRow(setting: Setting): void {
+		setting
 			.setName('Temperature')
 			.setDesc('Sampling temperature for generation (0 = deterministic, 1 = creative).')
 			.addSlider((sl) =>
 				sl
 					.setLimits(0, 1, 0.05)
-					.setValue(s.temperature)
+					.setValue(this.plugin.settings.temperature)
 					.onChange(async (v) => {
-						s.temperature = v;
+						this.plugin.settings.temperature = v;
 						await this.plugin.saveSettings();
 					})
 			);
+	}
 
-		new Setting(containerEl)
+	private buildStreamingRow(setting: Setting): void {
+		setting
 			.setName('Streaming responses')
 			.setDesc('Show live streaming text during generation. Disable for simpler debugging.')
 			.addToggle((t) =>
-				t.setValue(s.streaming).onChange(async (v) => {
-					s.streaming = v;
+				t.setValue(this.plugin.settings.streaming).onChange(async (v) => {
+					this.plugin.settings.streaming = v;
 					await this.plugin.saveSettings();
 				})
 			);
+	}
 
-		new Setting(containerEl)
-			.setName('Max tokens per request')
-			.setDesc('Token cap for a single generation call. Default: 4000. Raise it if reasoning models keep hitting the limit.')
+	/** Numeric text rows with parse + range validation (shared by several settings). */
+	private buildNumberRow(
+		setting: Setting,
+		name: string,
+		desc: string,
+		placeholder: string,
+		min: number,
+		max: number,
+		get: () => number,
+		set: (n: number) => void
+	): void {
+		setting
+			.setName(name)
+			.setDesc(desc)
 			.addText((t) =>
 				t
-					.setPlaceholder('4000')
-					.setValue(String(s.maxTokensPerRequest))
+					.setPlaceholder(placeholder)
+					.setValue(String(get()))
 					.onChange(async (v) => {
 						const n = parseInt(v, 10);
-						if (Number.isFinite(n) && n > 0) {
-							s.maxTokensPerRequest = n;
+						if (Number.isFinite(n) && n >= min && n <= max) {
+							set(n);
 							await this.plugin.saveSettings();
 						}
 					})
 			);
+	}
 
-		// ------------------------------------------------------- Generation
-		new Setting(containerEl).setName('Generation').setHeading();
+	private buildMaxTokensRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Max tokens per request',
+			'Token cap for a single generation call. Default: 4000. Raise it if reasoning models keep hitting the limit.',
+			'4000',
+			1,
+			Number.MAX_SAFE_INTEGER,
+			() => this.plugin.settings.maxTokensPerRequest,
+			(n) => (this.plugin.settings.maxTokensPerRequest = n)
+		);
+	}
 
-		new Setting(containerEl)
-			.setName('Max children per level')
-			.setDesc('Cap on children generated per expansion. Default: 7.')
-			.addText((t) =>
-				t
-					.setPlaceholder('7')
-					.setValue(String(s.maxChildrenPerLevel))
-					.onChange(async (v) => {
-						const n = parseInt(v, 10);
-						if (Number.isFinite(n) && n >= 1 && n <= 15) {
-							s.maxChildrenPerLevel = n;
-							await this.plugin.saveSettings();
-						}
-					})
-			);
+	private buildMaxChildrenRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Max children per level',
+			'Cap on children generated per expansion. Default: 7.',
+			'7',
+			1,
+			15,
+			() => this.plugin.settings.maxChildrenPerLevel,
+			(n) => (this.plugin.settings.maxChildrenPerLevel = n)
+		);
+	}
 
-		new Setting(containerEl)
-			.setName('Max depth')
-			.setDesc('Deepest level the plugin will auto-expand to. Default: 10.')
-			.addText((t) =>
-				t
-					.setPlaceholder('10')
-					.setValue(String(s.maxDepth))
-					.onChange(async (v) => {
-						const n = parseInt(v, 10);
-						if (Number.isFinite(n) && n >= 1 && n <= 50) {
-							s.maxDepth = n;
-							await this.plugin.saveSettings();
-						}
-					})
-			);
+	private buildMaxDepthRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Max depth',
+			'Deepest level the plugin will auto-expand to. Default: 10.',
+			'10',
+			1,
+			50,
+			() => this.plugin.settings.maxDepth,
+			(n) => (this.plugin.settings.maxDepth = n)
+		);
+	}
 
-		new Setting(containerEl)
-			.setName('Max nodes per batch')
-			.setDesc('Node budget for a single batch expansion. Default: 100.')
-			.addText((t) =>
-				t
-					.setPlaceholder('100')
-					.setValue(String(s.maxNodesPerBatch))
-					.onChange(async (v) => {
-						const n = parseInt(v, 10);
-						if (Number.isFinite(n) && n >= 10 && n <= 500) {
-							s.maxNodesPerBatch = n;
-							await this.plugin.saveSettings();
-						}
-					})
-			);
+	private buildMaxNodesRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Max nodes per batch',
+			'Node budget for a single batch expansion. Default: 100.',
+			'100',
+			10,
+			500,
+			() => this.plugin.settings.maxNodesPerBatch,
+			(n) => (this.plugin.settings.maxNodesPerBatch = n)
+		);
+	}
 
-		// ------------------------------------------------------------- UI
-		new Setting(containerEl).setName('UI').setHeading();
+	private buildAutoExpandRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Auto-expand depth',
+			'Levels expanded automatically when a tree opens (no API calls). Default: 1.',
+			'1',
+			0,
+			10,
+			() => this.plugin.settings.autoExpandDepth,
+			(n) => (this.plugin.settings.autoExpandDepth = n)
+		);
+	}
 
-		new Setting(containerEl)
-			.setName('Auto-expand depth')
-			.setDesc('Levels expanded automatically when a tree opens (no API calls). Default: 1.')
-			.addText((t) =>
-				t
-					.setPlaceholder('1')
-					.setValue(String(s.autoExpandDepth))
-					.onChange(async (v) => {
-						const n = parseInt(v, 10);
-						if (Number.isFinite(n) && n >= 0 && n <= 10) {
-							s.autoExpandDepth = n;
-							await this.plugin.saveSettings();
-						}
-					})
-			);
-
-		new Setting(containerEl)
+	private buildComplexityRow(setting: Setting): void {
+		setting
 			.setName('Show complexity badges')
 			.setDesc('Display Beginner/Intermediate/Advanced indicators in the tree.')
 			.addToggle((t) =>
-				t.setValue(s.showComplexity).onChange(async (v) => {
-					s.showComplexity = v;
+				t.setValue(this.plugin.settings.showComplexity).onChange(async (v) => {
+					this.plugin.settings.showComplexity = v;
 					await this.plugin.saveSettings();
 					this.plugin.treeView?.render();
 				})
 			);
+	}
 
-		new Setting(containerEl)
+	private buildVirtualizeRow(setting: Setting): void {
+		setting
 			.setName('Virtualize rendering')
 			.setDesc('Only render the rows visible in the viewport. Recommended for tens of thousands of nodes.')
 			.addToggle((t) =>
-				t.setValue(s.virtualizeRendering).onChange(async (v) => {
-					s.virtualizeRendering = v;
+				t.setValue(this.plugin.settings.virtualizeRendering).onChange(async (v) => {
+					this.plugin.settings.virtualizeRendering = v;
 					await this.plugin.saveSettings();
 					this.plugin.treeView?.render();
 				})
 			);
+	}
 
-		// ------------------------------------------------------- Performance
-		new Setting(containerEl).setName('Performance & Storage').setHeading();
+	private buildCacheExpiryRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Cache expiry (hours)',
+			'How long generated results are cached. Set 0 to disable caching. Default: 24.',
+			'24',
+			0,
+			Number.MAX_SAFE_INTEGER,
+			() => this.plugin.settings.cacheExpiryHours,
+			(n) => (this.plugin.settings.cacheExpiryHours = n)
+		);
+	}
 
-		new Setting(containerEl)
-			.setName('Cache expiry (hours)')
-			.setDesc('How long generated results are cached. Set 0 to disable caching. Default: 24.')
-			.addText((t) =>
-				t
-					.setPlaceholder('24')
-					.setValue(String(s.cacheExpiryHours))
-					.onChange(async (v) => {
-						const n = parseInt(v, 10);
-						if (Number.isFinite(n) && n >= 0) {
-							s.cacheExpiryHours = n;
-							await this.plugin.saveSettings();
-						}
-					})
-			);
-
-		new Setting(containerEl)
+	private buildTreeFolderRow(setting: Setting): void {
+		setting
 			.setName('Tree folder')
 			.setDesc('Vault folder that stores generated concept trees.')
 			.addText((t) =>
 				t
 					.setPlaceholder('CogniTree')
-					.setValue(s.treeFolder)
+					.setValue(this.plugin.settings.treeFolder)
 					.onChange(async (v) => {
-						s.treeFolder = v.trim() || 'CogniTree';
+						this.plugin.settings.treeFolder = v.trim() || 'CogniTree';
 						await this.plugin.saveSettings();
-						this.plugin.indexer?.init(s.treeFolder);
+						this.plugin.indexer?.init(this.plugin.settings.treeFolder);
 					})
 			);
+	}
 
-		// ----------------------------------------------------------- Actions
-		new Setting(containerEl).setName('Data').setHeading();
-
-		new Setting(containerEl)
+	private buildClearCacheRow(setting: Setting): void {
+		setting
 			.setName('Clear response cache')
 			.setDesc(`Currently ${this.plugin.cache?.size ?? 0} cached generations. Cached results reduce API cost.`)
 			.addButton((b) =>
@@ -311,7 +439,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 					.onClick(async () => {
 						await this.plugin.cache?.clear();
 						new Notice('CogniTree cache cleared.');
-						this.display();
+						this.refresh();
 					})
 			);
 	}
