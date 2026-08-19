@@ -1,4 +1,9 @@
-import { Notice, requestUrl } from 'obsidian';
+import {
+	Notice,
+	requestUrl,
+	type RequestUrlParam,
+	type RequestUrlResponse,
+} from 'obsidian';
 import { providerFor, type PluginSettings } from './types';
 
 export interface ChatMessage {
@@ -38,9 +43,13 @@ export class ReasoningTruncatedError extends ApiError {
  */
 const REASONING_RETRY_MAX_TOKENS = 8000;
 
+/** Longest a single request may take before it is treated as hung. */
+const REQUEST_TIMEOUT_MS = 180_000;
+
 /**
  * Minimal OpenAI-compatible chat-completions client (works with DeepSeek,
- * OpenAI, OpenRouter, Ollama, LM Studio, …). Supports SSE streaming.
+ * OpenAI, OpenRouter, Ollama, LM Studio, …). All traffic goes through
+ * Obsidian's `requestUrl` (the sanctioned network API) — no `fetch`.
  */
 export class ApiClient {
 	private readonly settings: PluginSettings;
@@ -92,7 +101,10 @@ export class ApiClient {
 
 	/**
 	 * Run a chat completion and return the full assistant text.
-	 * Streams when settings.streaming is true and onDelta is provided.
+	 * `requestUrl` cannot be aborted or streamed incrementally, so a watchdog
+	 * timeout guards against hung servers, and buffered SSE deltas are
+	 * replayed through `onDelta` in order (identical content, delivered in
+	 * small steps so the UI still paints progressively).
 	 */
 	async chat(messages: ChatMessage[], opts: ChatOptions): Promise<string> {
 		const apiKey = this.settings.apiKey.trim();
@@ -102,6 +114,9 @@ export class ApiClient {
 			throw new ApiError(
 				'No API key configured. Open CogniTree settings (gear icon in the view, or Settings → CogniTree) and paste your key.'
 			);
+		}
+		if (opts.signal?.aborted) {
+			throw new ApiError('Request was aborted.');
 		}
 
 		const url = this.endpoint();
@@ -115,37 +130,36 @@ export class ApiClient {
 			stream: opts.streaming && !!opts.onDelta,
 		};
 
-		const controller = new AbortController();
-		const timeout = window.setTimeout(() => controller.abort(), 180_000);
-		if (opts.signal) {
-			opts.signal.addEventListener('abort', () => controller.abort(), { once: true });
-		}
-
 		try {
-			const res = await fetch(url, {
+			const res = await this.requestWithTimeout({
+				url,
 				method: 'POST',
 				headers,
 				body: JSON.stringify(body),
-				signal: controller.signal,
+				throw: false,
 			});
 
-			if (!res.ok) {
+			if (res.status >= 400) {
 				let detail = '';
 				try {
-					detail = (await res.text()).slice(0, 500);
+					detail = res.text.slice(0, 500);
 				} catch {
 					/* ignore */
 				}
 				throw new ApiError(
-					`API request failed (${res.status}): ${detail || res.statusText}`,
+					`API request failed (${res.status}): ${detail || `HTTP ${res.status}`}`,
 					res.status
 				);
 			}
 
-			if (body.stream) {
-				return await this.readStream(res, opts.onDelta!);
+			if (opts.signal?.aborted) {
+				throw new ApiError('Request was aborted.');
 			}
-			const data = (await res.json()) as {
+
+			if (body.stream) {
+				return await this.parseSse(res.text, opts.onDelta!);
+			}
+			const data = res.json as {
 				choices?: {
 					message?: { content?: string; reasoning_content?: string };
 				}[];
@@ -179,22 +193,39 @@ export class ApiClient {
 				throw new ApiError('Request timed out or was aborted.');
 			}
 			throw new ApiError(`Network error: ${(err as Error).message}`);
-		} finally {
-			window.clearTimeout(timeout);
 		}
 	}
 
-	/** Parse an SSE stream of `data:` lines and accumulate assistant deltas. */
-	private async readStream(res: Response, onDelta: (d: string) => void): Promise<string> {
-		if (!res.body) throw new ApiError('Streaming response has no body.');
-		const reader = res.body.getReader();
-		const decoder = new TextDecoder();
-		let buffer = '';
-		let raw = '';
+	/** Run `requestUrl` under a watchdog timeout (requestUrl itself cannot be aborted). */
+	private async requestWithTimeout(params: RequestUrlParam): Promise<RequestUrlResponse> {
+		let timer = 0;
+		try {
+			return await Promise.race([
+				requestUrl(params),
+				new Promise<never>((_, reject) => {
+					timer = window.setTimeout(
+						() => reject(new ApiError(`Request timed out after ${REQUEST_TIMEOUT_MS / 1000}s.`)),
+						REQUEST_TIMEOUT_MS
+					);
+				}),
+			]);
+		} finally {
+			window.clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * Parse a buffered SSE body (`data:` lines) and replay the deltas through
+	 * `onDelta` with a tiny yield between chunks so the UI can paint them
+	 * progressively. Falls back to a plain JSON body when the server ignored
+	 * `stream: true`.
+	 */
+	private async parseSse(text: string, onDelta: (d: string) => void): Promise<string> {
 		let full = '';
 		let finishReason = '';
 		let sawDataLine = false;
 		let sawReasoning = false;
+		const deltas: string[] = [];
 
 		const handleLine = (line: string) => {
 			if (!line.startsWith('data:')) return;
@@ -229,32 +260,17 @@ export class ApiClient {
 			// Standard OpenAI-style streaming uses `delta.content`. Some
 			// OpenAI-compatible servers instead deliver the whole answer in a
 			// single `message.content` chunk — accept that as a fallback.
-			const text = delta.content ?? (full === '' ? choice.message?.content : undefined);
-			if (typeof text === 'string' && text.length > 0) {
-				full += text;
-				onDelta(text);
+			const chunk = delta.content ?? (full === '' ? choice.message?.content : undefined);
+			if (typeof chunk === 'string' && chunk.length > 0) {
+				full += chunk;
+				deltas.push(chunk);
 			}
 			if (choice.finish_reason) finishReason = String(choice.finish_reason);
 		};
 
-		for (;;) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			const chunk = decoder.decode(value, { stream: true });
-			buffer += chunk;
-			raw += chunk;
-			// SSE lines may end with \n, \r, or \r\n — split on both.
-			let nl: number;
-			while ((nl = buffer.search(/[\r\n]/)) !== -1) {
-				const line = buffer.slice(0, nl);
-				buffer = buffer.slice(nl + 1);
-				handleLine(line);
-			}
+		for (const line of text.split(/\r?\n/)) {
+			handleLine(line);
 		}
-		const tail = decoder.decode();
-		buffer += tail;
-		raw += tail;
-		if (buffer.trim()) handleLine(buffer.trim());
 
 		if (finishReason === 'content_filter') {
 			throw new ApiError(
@@ -265,11 +281,11 @@ export class ApiClient {
 			// A server may ignore `stream: true` and return a plain JSON body.
 			if (!sawDataLine) {
 				try {
-					const json = JSON.parse(raw) as {
+					const json = JSON.parse(text) as {
 						choices?: { message?: { content?: unknown } }[];
 					};
-					const text = json.choices?.[0]?.message?.content;
-					if (typeof text === 'string' && text.length > 0) return text;
+					const t = json.choices?.[0]?.message?.content;
+					if (typeof t === 'string' && t.length > 0) return t;
 				} catch {
 					/* not a JSON body — fall through */
 				}
@@ -280,6 +296,13 @@ export class ApiClient {
 				);
 			}
 			throw new ApiError('Stream finished without any content.');
+		}
+
+		// Replay deltas so the caller observes progressive text; yield between
+		// chunks so the browser can paint the status updates.
+		for (const d of deltas) {
+			onDelta(d);
+			await new Promise((resolve) => setTimeout(resolve, 0));
 		}
 		return full;
 	}
