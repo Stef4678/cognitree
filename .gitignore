@@ -1,0 +1,7 @@
+node_modules/
+.npm-cache/
+main.js
+main.js.map
+.tmp-smoke.js
+.claude/
+*.log
