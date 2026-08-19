@@ -16,28 +16,18 @@ import { PROVIDERS, curatedModelsFor, providerFor } from './types';
  *  - UI: autoExpandDepth, showComplexity, virtualizeRendering
  *  - Performance: cacheExpiryHours
  *
- * Dual-implementation (Obsidian docs "Migrate to declarative settings", Path B):
- *  - Obsidian >= 1.13 renders from `getSettingDefinitions()` and skips `display()`.
- *  - Older versions run `display()`. Both paths share the same row builders,
- *    so there is a single source of truth for the UI.
+ * Declarative settings (Obsidian docs "Migrate to declarative settings",
+ * Path A): the tab renders entirely from `getSettingDefinitions()`, which
+ * also powers Obsidian's settings search. Requires Obsidian >= 1.13
+ * (see manifest.json minAppVersion); the legacy `display()` override is
+ * intentionally not used.
  */
 export class CogniTreeSettingTab extends PluginSettingTab {
 	constructor(private plugin: CogniTreePlugin) {
 		super(plugin.app, plugin);
 	}
 
-	// ------------------------------------------------------------ legacy path
-
-	/** Imperative rendering — used on Obsidian < 1.13. */
-	display(): void {
-		const { containerEl } = this;
-		containerEl.empty();
-		this.buildAll(containerEl);
-	}
-
-	// ------------------------------------------------------- declarative path
-
-	/** Declarative definitions — used on Obsidian >= 1.13 (display() is skipped). */
+	/** Declarative definitions — rendered by Obsidian >= 1.13. */
 	getSettingDefinitions(): SettingDefinitionItem[] {
 		const def = (
 			name: string,
@@ -98,41 +88,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 		];
 	}
 
-	/** Re-render on both rendering paths (display for < 1.13, update for >= 1.13). */
-	private refresh(): void {
-		this.display();
-		this.update?.();
-	}
-
 	// -------------------------------------------------------------- builders
-
-	private buildAll(container: HTMLElement): void {
-		new Setting(container).setName('Configuration').setHeading();
-		this.buildApiKeyRow(new Setting(container));
-		this.buildProviderRow(new Setting(container));
-		this.buildEndpointRow(new Setting(container));
-		this.buildModelRow(new Setting(container));
-		this.buildTemperatureRow(new Setting(container));
-		this.buildStreamingRow(new Setting(container));
-		this.buildMaxTokensRow(new Setting(container));
-
-		new Setting(container).setName('Generation').setHeading();
-		this.buildMaxChildrenRow(new Setting(container));
-		this.buildMaxDepthRow(new Setting(container));
-		this.buildMaxNodesRow(new Setting(container));
-
-		new Setting(container).setName('UI').setHeading();
-		this.buildAutoExpandRow(new Setting(container));
-		this.buildComplexityRow(new Setting(container));
-		this.buildVirtualizeRow(new Setting(container));
-
-		new Setting(container).setName('Performance & Storage').setHeading();
-		this.buildCacheExpiryRow(new Setting(container));
-		this.buildTreeFolderRow(new Setting(container));
-
-		new Setting(container).setName('Data').setHeading();
-		this.buildClearCacheRow(new Setting(container));
-	}
 
 	private buildApiKeyRow(setting: Setting): void {
 		setting
@@ -165,7 +121,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 				dd.onChange(async (v) => {
 					if (v === '__custom__') return; // keep current endpoint as-is
 					await this.plugin.applyProvider(v);
-					this.refresh();
+					this.update();
 				});
 			});
 	}
@@ -229,7 +185,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 								? `Found ${ids.length} models on this endpoint.`
 								: 'Could not fetch models — the endpoint may not expose GET /models (e.g. Ollama). Custom ids still work.'
 						);
-						this.refresh();
+						this.update();
 					})
 			);
 
@@ -439,7 +395,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 					.onClick(async () => {
 						await this.plugin.cache?.clear();
 						new Notice('CogniTree cache cleared.');
-						this.refresh();
+						this.update();
 					})
 			);
 	}
