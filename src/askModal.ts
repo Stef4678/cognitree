@@ -48,23 +48,21 @@ const PRESETS: Preset[] = [
 	},
 ];
 
-/** Element factory — content is always attached via textContent, never parsed as HTML. */
-function makeEl<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string): HTMLElementTagNameMap[K] {
-	const node = document.createElement(tag);
-	if (cls) node.className = cls;
-	return node;
-}
-
 const HEADING_TAGS = { 3: 'h3', 4: 'h4', 5: 'h5', 6: 'h6' } as const;
 
-/** Match one inline construct: `code`, [[wikilink]], **bold**, *italic*. */
+/**
+ * Match one inline construct: `code`, [[wikilink]], **bold**, *italic*.
+ * No lookbehind (unsupported on iOS before 16.4): the bold alternative is
+ * tried before the italic one at every position, so `**…**` is always
+ * consumed by bold and never mis-parsed as italic.
+ */
 const INLINE_RE =
-	/(`[^`\n]+`)|(\[\[[^\]\n]+\]\])|(\*\*[^*\n]+\*\*)|(?<=^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g;
+	/(`[^`\n]+`)|(\[\[[^\]\n]+\]\])|(\*\*([^*\n]+)\*\*)|(\*([^*\n]+)\*)/g;
 
 /**
- * Append inline Markdown to `container` as real DOM nodes. Every text
- * fragment reaches the DOM through textContent / createTextNode, so model
- * output can never inject markup.
+ * Append inline Markdown to `container` as real DOM nodes, created with
+ * Obsidian's `createEl`. Every text fragment reaches the DOM through
+ * textContent / createTextNode, so model output can never inject markup.
  */
 function renderInline(container: HTMLElement, text: string): void {
 	if (!text) return;
@@ -76,21 +74,17 @@ function renderInline(container: HTMLElement, text: string): void {
 		}
 		last = m.index + m[0].length;
 		if (m[1]) {
-			const code = makeEl('code');
+			const code = container.createEl('code');
 			code.textContent = m[1].slice(1, -1);
-			container.appendChild(code);
 		} else if (m[2]) {
-			const wl = makeEl('span', 'ct-wl');
+			const wl = container.createEl('span', { cls: 'ct-wl' });
 			wl.textContent = m[2].slice(2, -2).split('|')[0].trim();
-			container.appendChild(wl);
 		} else if (m[3]) {
-			const b = makeEl('strong');
-			b.textContent = m[3].slice(2, -2);
-			container.appendChild(b);
-		} else if (m[4]) {
-			const em = makeEl('em');
-			em.textContent = m[4];
-			container.appendChild(em);
+			const b = container.createEl('strong');
+			b.textContent = m[4];
+		} else if (m[5]) {
+			const em = container.createEl('em');
+			em.textContent = m[6];
 		}
 	}
 	if (last < text.length) {
@@ -122,36 +116,31 @@ function renderChatMarkdown(root: HTMLElement, markdown: string): void {
 				i++;
 			}
 			i++; // skip the closing fence
-			const pre = makeEl('pre', 'ct-ask-code');
-			const codeEl = makeEl('code');
+			const pre = root.createEl('pre', { cls: 'ct-ask-code' });
+			const codeEl = pre.createEl('code');
 			codeEl.textContent = buf.join('\n');
-			pre.appendChild(codeEl);
-			root.appendChild(pre);
 			continue;
 		}
 		const heading = raw.match(/^(#{1,6})\s+(.*)$/);
 		if (heading) {
 			const level = Math.min(heading[1].length + 2, 6) as keyof typeof HEADING_TAGS;
-			const h = makeEl(HEADING_TAGS[level]);
+			const h = root.createEl(HEADING_TAGS[level]);
 			renderInline(h, heading[2]);
-			root.appendChild(h);
 			i++;
 			continue;
 		}
 		const isUl = /^\s*[-*+]\s+/.test(raw);
 		const isOl = /^\s*\d+[.)]\s+/.test(raw);
 		if (isUl || isOl) {
-			const list = makeEl(isUl ? 'ul' : 'ol');
+			const list = root.createEl(isUl ? 'ul' : 'ol');
 			while (i < lines.length && lines[i].trim()) {
 				const line = lines[i].trim();
 				const item = line.match(/^(?:[-*+]|\d+[.)])\s+(.*)$/);
 				if (!item) break;
-				const li = makeEl('li');
+				const li = list.createEl('li');
 				renderInline(li, item[1]);
-				list.appendChild(li);
 				i++;
 			}
-			root.appendChild(list);
 			continue;
 		}
 		// Paragraph: absorb until a blank line or another block start.
@@ -165,9 +154,8 @@ function renderChatMarkdown(root: HTMLElement, markdown: string): void {
 			para.push(lines[i].trim());
 			i++;
 		}
-		const p = makeEl('p');
+		const p = root.createEl('p');
 		renderInline(p, para.join(' '));
-		root.appendChild(p);
 	}
 }
 
