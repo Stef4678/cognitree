@@ -14,6 +14,7 @@ import { normalizeKey } from './parser';
 import { ApiError } from './api';
 import type CogniTreePlugin from './main';
 import { buildJsonSnapshot, buildOutline, buildTreeSvg } from './exporters';
+import { AskModal } from './askModal';
 
 export const VIEW_TYPE = 'cognitree-view';
 
@@ -573,6 +574,34 @@ export class ConceptTreeView extends ItemView {
 		}
 	}
 
+	// ------------------------------------------------------------- follow-up (Ask)
+
+	/** True when a tree is open — lets palette commands enable/disable. */
+	hasTree(): boolean {
+		return !!this.model;
+	}
+
+	/** Open the grounded Ask chat for a node (default: selection, then root). */
+	openAsk(name?: string): void {
+		if (!this.model) {
+			new Notice('Open a tree first.');
+			return;
+		}
+		const target = name ?? this.selected ?? this.model.root;
+		const node = this.model.nodes.get(target);
+		if (!node) return;
+		new AskModal(this.app, this.plugin, this.model, node).open();
+	}
+
+	/** Palette-command entry: ask about the current selection (or tree root). */
+	askAboutSelected(): boolean {
+		if (!this.model) return false;
+		const target = this.selected ?? this.model.root;
+		if (!this.model.nodes.has(target)) return false;
+		this.openAsk(target);
+		return true;
+	}
+
 	// ------------------------------------------------------------- connections
 
 	private async findConnections(name: string): Promise<void> {
@@ -621,6 +650,12 @@ export class ConceptTreeView extends ItemView {
 				.setTitle('Expand with AI')
 				.setIcon('sparkles')
 				.onClick(() => void this.expandNode(name))
+		);
+		menu.addItem((item) =>
+			item
+				.setTitle('Ask about this concept')
+				.setIcon('message-circle')
+				.onClick(() => this.openAsk(name))
 		);
 		menu.addItem((item) =>
 			item
@@ -983,6 +1018,15 @@ export class ConceptTreeView extends ItemView {
 			bExpand.addEventListener('click', (e) => {
 				e.stopPropagation();
 				void this.expandNode(name);
+			});
+			const bAsk = actions.createEl('button', {
+				cls: 'ct-btn',
+				text: '💬',
+				attr: { title: 'Ask about this concept (grounded chat)' },
+			});
+			bAsk.addEventListener('click', (e) => {
+				e.stopPropagation();
+				this.openAsk(name);
 			});
 			const bLink = actions.createEl('button', {
 				cls: 'ct-btn',

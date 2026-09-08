@@ -239,6 +239,117 @@ by an object due to its motion.",
 	);
 }
 
+// --- ask / follow-up -------------------------------------------------------
+import {
+	buildBranchDigest,
+	parseSuggestedChildren,
+} from '../src/ask';
+import type { TreeModel, TreeNode } from '../src/types';
+import { buildFollowUpSystem } from '../src/prompts';
+
+{
+	const node = (
+		name: string,
+		parent: string | null,
+		description: string,
+		children: string[] = [],
+		options: Partial<TreeNode> = {}
+	): TreeNode => ({
+		name,
+		parent,
+		description,
+		complexity: 'Beginner',
+		canExpand: true,
+		estimatedDepth: 4,
+		connections: [],
+		children,
+		path: `/${name.toLowerCase().replace(/\s+/g, '_')}`,
+		created: 0,
+		file: `CogniTree/Democracy/${name}.md`,
+		treeRoot: 'Democracy',
+		expanded: false,
+		loading: false,
+		...options,
+	});
+	const model: TreeModel = {
+		root: 'Democracy',
+		folder: 'CogniTree/Democracy',
+		updatedAt: 1,
+		nodes: new Map([
+			['Democracy', node('Democracy', null, 'System of government.')],
+			[
+				'Direct Democracy',
+				node('Direct Democracy', 'Democracy', 'Citizens vote directly on laws.', [
+					'Referendums',
+					'Citizen Assemblies',
+				]),
+			],
+			['Referendums', node('Referendums', 'Direct Democracy', 'Direct votes on specific laws.')],
+			[
+				'Citizen Assemblies',
+				node('Citizen Assemblies', 'Direct Democracy', 'Sortition-based deliberative bodies.'),
+			],
+		]),
+	};
+
+	const d = buildBranchDigest(model, 'Direct Democracy', 20, 20000);
+	assert(d.text.includes('Focus: "Direct Democracy"'), 'digest: focus named');
+	assert(d.text.includes('Democracy ▸ Direct Democracy'), 'digest: ancestry chain');
+	assert(d.text.includes('Referendums'), 'digest: descendant included');
+	assert(d.text.includes('Citizens vote directly on laws.'), 'digest: focus description included');
+	assert(d.nodeCount >= 3 && d.omitted === 0, 'digest: counts without caps');
+
+	const capped = buildBranchDigest(model, 'Direct Democracy', 1, 20000);
+	assert(capped.nodeCount === 2 && capped.omitted >= 1, 'digest: node cap respected');
+	const charCapped = buildBranchDigest(model, 'Direct Democracy', 20, 60);
+	assert(charCapped.text.includes('omitted'), 'digest: char cap → truncation note');
+
+	const leaf = buildBranchDigest(model, 'Referendums', 20, 20000);
+	assert(
+		leaf.text.includes('nearby siblings') && leaf.text.includes('Citizen Assemblies'),
+		'digest: leaf gets sibling anchors'
+	);
+
+	// suggested-children parser
+	const withSection = [
+		'Here is my plan.',
+		'',
+		'### Suggested children',
+		'- Swiss Referendums: Binding votes in Switzerland',
+		'- **Citizen Initiated Referendums** — proposed by citizens',
+		'- Mandatory Referendums – required by law',
+		'',
+		'## Next steps',
+		'- not a child',
+	].join('\n');
+	const kids = parseSuggestedChildren(withSection);
+	assert(kids.length === 3, 'suggested children: parsed 3 items');
+	assert(kids[0]?.name === 'Swiss Referendums', 'suggested children: colon separator');
+	assert(
+		kids[1]?.name === 'Citizen Initiated Referendums' && kids[1]?.description === 'proposed by citizens',
+		'suggested children: bold + em-dash separator'
+	);
+	assert(
+		kids[2]?.name === 'Mandatory Referendums' && kids[2]?.description === 'required by law',
+		'suggested children: en-dash separator'
+	);
+	assert(
+		parseSuggestedChildren('no section at all\n- Something: nope').length === 0,
+		'suggested children: [] without heading'
+	);
+	const boldHead = parseSuggestedChildren('**Suggested children:**\n- A Child: ok');
+	assert(boldHead.length === 1 && boldHead[0]?.name === 'A Child', 'suggested children: bold heading');
+	const dupe = parseSuggestedChildren('### Suggested children\n- Swiss Referendums: one\n- Swiss Referendums: two');
+	assert(dupe.length === 1, 'suggested children: duplicates deduped');
+
+	// follow-up system prompt
+	const sys = buildFollowUpSystem(d.text, 'Direct Democracy');
+	assert(
+		sys.includes('Direct Democracy') && sys.includes('Referendums') && sys.includes('### Suggested children'),
+		'follow-up system: focus + digest + adopt contract'
+	);
+}
+
 // --- report --------------------------------------------------------------
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} TEST(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

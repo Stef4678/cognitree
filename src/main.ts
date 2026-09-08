@@ -95,6 +95,16 @@ export default class CogniTreePlugin extends Plugin {
 			name: 'Reindex vault notes',
 			callback: () => void this.reindexNotes(),
 		});
+		this.addCommand({
+			id: 'ask-about-selected',
+			name: 'Ask about selected concept',
+			checkCallback: (checking) => {
+				const view = this.treeView;
+				if (!view || !view.hasTree()) return false;
+				if (!checking) view.askAboutSelected();
+				return true;
+			},
+		});
 
 		this.addSettingTab(new CogniTreeSettingTab(this));
 

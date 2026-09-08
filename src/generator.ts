@@ -319,6 +319,34 @@ export class ConceptGenerator {
 		return { added, skipped };
 	}
 
+	// ---------------------------------------------------------------- 5. Follow-up chat
+
+	/**
+	 * Non-cached chat completion for the "Ask about this concept" flow.
+	 * Follow-up answers depend on the live tree and the conversation history,
+	 * so they bypass the response cache (cached generation prompts still hit it).
+	 *
+	 * The Ask chat starts with a >= 8000-token budget even when the global
+	 * `maxTokensPerRequest` is smaller: critique questions over a long branch
+	 * digest regularly exhaust a 4000-token budget while the model is still
+	 * reasoning, which used to trigger a silent second round-trip and double
+	 * the wait. A single, larger call finishes sooner than two calls.
+	 */
+	async followUpChat(
+		messages: ChatMessage[],
+		onDelta?: (d: string) => void,
+		onRetry?: (nextMaxTokens: number) => void
+	): Promise<string> {
+		const s = this.settings();
+		return this.api.chat(messages, {
+			maxTokens: Math.max(s.maxTokensPerRequest, 8000),
+			temperature: s.temperature,
+			streaming: s.streaming,
+			onDelta,
+			onRetry,
+		});
+	}
+
 	static notice(err: unknown): void {
 		if (err instanceof ApiError || err instanceof Error) {
 			new Notice(err.message, 8000);

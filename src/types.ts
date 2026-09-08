@@ -132,6 +132,9 @@ export interface PluginSettings {
 	// Performance
 	cacheExpiryHours: number; // default: 24
 	treeFolder: string; // vault folder that holds generated trees
+	// Follow-up chat ("Ask about this concept")
+	askContextMaxNodes: number; // default: 60 — nodes included in the branch digest
+	askContextMaxChars: number; // default: 10000 — character budget for the digest
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -149,6 +152,8 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	virtualizeRendering: true,
 	cacheExpiryHours: 24,
 	treeFolder: 'CogniTree',
+	askContextMaxNodes: 60,
+	askContextMaxChars: 10000,
 };
 
 /** Curated model suggestions shown in the pickers before the endpoint list loads. */

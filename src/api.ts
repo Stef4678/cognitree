@@ -17,6 +17,8 @@ export interface ChatOptions {
 	streaming: boolean;
 	/** Called for each streamed text delta (when streaming is enabled). */
 	onDelta?: (delta: string) => void;
+	/** Called just before an automatic retry with a larger budget (reasoning models). */
+	onRetry?: (nextMaxTokens: number) => void;
 	signal?: AbortSignal;
 }
 
@@ -183,9 +185,11 @@ export class ApiClient {
 				err instanceof ReasoningTruncatedError &&
 				opts.maxTokens < REASONING_RETRY_MAX_TOKENS
 			) {
+				const next = Math.min(REASONING_RETRY_MAX_TOKENS, opts.maxTokens * 4);
+				opts.onRetry?.(next);
 				return await this.chat(messages, {
 					...opts,
-					maxTokens: Math.min(REASONING_RETRY_MAX_TOKENS, opts.maxTokens * 4),
+					maxTokens: next,
 				});
 			}
 			if (err instanceof ApiError) throw err;

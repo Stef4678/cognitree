@@ -63,6 +63,14 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			},
 			{
 				type: 'group',
+				heading: 'Ask & follow-up',
+				items: [
+					def('Ask: context nodes', 'How many branch nodes are included in the grounding context when you ask a question about a concept (plus a character budget below). Default: 60.', (s) => this.buildAskContextNodesRow(s)),
+					def('Ask: context characters', 'Character budget for the grounding context of one question — protects small-context models from huge branches. Default: 10000.', (s) => this.buildAskContextCharsRow(s)),
+				],
+			},
+			{
+				type: 'group',
 				heading: 'UI',
 				items: [
 					def('Auto-expand depth', 'Levels expanded automatically when a tree opens (no API calls). Default: 1.', (s) => this.buildAutoExpandRow(s)),
@@ -314,6 +322,32 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			500,
 			() => this.plugin.settings.maxNodesPerBatch,
 			(n) => (this.plugin.settings.maxNodesPerBatch = n)
+		);
+	}
+
+	private buildAskContextNodesRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Ask: context nodes',
+			'How many branch nodes are included in the grounding context when you ask a question about a concept. Default: 60.',
+			'60',
+			5,
+			400,
+			() => this.plugin.settings.askContextMaxNodes,
+			(n) => (this.plugin.settings.askContextMaxNodes = n)
+		);
+	}
+
+	private buildAskContextCharsRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Ask: context characters',
+			'Character budget for the grounding context of one question. Default: 10000.',
+			'10000',
+			1000,
+			50000,
+			() => this.plugin.settings.askContextMaxChars,
+			(n) => (this.plugin.settings.askContextMaxChars = n)
 		);
 	}
 

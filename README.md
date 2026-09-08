@@ -13,6 +13,7 @@ Built around a **four-prompt system** (Discovery, Expansion, Connection Discover
 | **Discovery** (root concept) | Polymathic taxonomist prompt → 3–7 domains × 3–5 children |
 | **Expansion** (drill deeper) | Knowledge-graph engineer prompt → 5–10 granular sub-concepts with `can_expand` / `estimated_depth` |
 | **Connection Discovery** | Ranked vault-note candidates (background index) → relationship types + priorities; link or create notes |
+| **Ask & follow-up chat** | Grounded Q&A on any node: branch digest + linked-vault-notes context, streaming, Explain / Quiz / Critique / Expansion presets, adoptable *Suggested children* |
 | **Batch expansion** | Level-by-level BFS with bounded concurrency, node budget, live progress bar |
 | **Incremental growth** | Never generate the whole tree at once; expand branches on demand |
 | **Markdown storage** | One note per concept, full frontmatter (parent, domain, complexity, children, connections, path), wikilink `## Connections` section |
@@ -34,6 +35,7 @@ Built around a **four-prompt system** (Discovery, Expansion, Connection Discover
 | **Batch connections** | Right-click → **Find connections in subtree** — runs the connection pass over every node and auto-links high-priority hits |
 | **Tree stats & health** | Right-click → **Tree stats & health** — depth distribution, complexity breakdown, orphaned / dangling-node detection |
 | **Duplicate detection** | Right-click → **Find duplicates across trees** — lists concepts present in 2+ trees with **Link** and **Merge A→B / B→A** actions |
+| **Ask about a concept** | Right-click (or the row's **💬**) → a grounded, streaming chat on that node: *Explain*, *Quiz me*, *Gaps & contradictions*, *Next expansion* presets or any free question. Answers are anchored in a digest of the branch + linked vault notes, and *Suggested children* can be adopted straight into the tree |
 | **Batch without collapsing** | Batch expansion preserves the current expansion state, then expands the batch subtree afterwards |
 | **Expand all / Collapse** | Toolbar buttons to show or hide the whole tree at once |
 | **Manual reindex** | **♺ Index** toolbar button (or the *Reindex vault notes* command) rebuilds the connection index on demand |
@@ -45,7 +47,7 @@ Built around a **four-prompt system** (Discovery, Expansion, Connection Discover
 1. **Install** — copy `main.js`, `manifest.json`, `styles.css` into `<vault>/.obsidian/plugins/cognitree/` and enable the plugin. (Or `git clone` and run `npm run build`.)
 2. **Set your API key** — ribbon icon 🕸 *Open CogniTree* → **⚙** in the header → paste your key (defaults to DeepSeek + `deepseek-v4-flash`). To use another provider, pick it from the **Provider** dropdown — the endpoint and model list switch automatically (Ollama / LM Studio need no key).
 3. **Generate a tree** — type `democracy` in the input and press **Generate**. The Discovery prompt creates the root + domain children as notes under `CogniTree/Democracy/`.
-4. **Explore** — click a row to select (or use **↑ / ↓** to navigate with the keyboard and a live preview tooltip); use **Expand** (Expansion prompt), **🔗** (Find connections), **Batch expand** (subtree to a depth), hover for the description preview, right-click for the context menu (copy, export, stats, duplicates, safe delete), double-click to open the note, and **⛶ Expand all** / **⛁ Collapse** / **♺ Index** from the toolbar.
+4. **Explore** — click a row to select (or use **↑ / ↓** to navigate with the keyboard and a live preview tooltip); use **Expand** (Expansion prompt), **💬** (Ask about this concept), **🔗** (Find connections), **Batch expand** (subtree to a depth), hover for the description preview, right-click for the context menu (ask, copy, export, stats, duplicates, safe delete), double-click to open the note, and **⛶ Expand all** / **⛁ Collapse** / **♺ Index** from the toolbar.
 
 Example flow: `democracy` → Discovery → *Political Science / Direct Democracy / Referendums* → click **Referendums** → Expansion → *Mandatory / Optional / Popular Initiative* → **🔗 Find connections** → link to *Elections*, *Switzerland*, *Popular Sovereignty*.
 
@@ -72,6 +74,8 @@ Mirrors the spec's `PluginSettings`:
 | `virtualizeRendering` | `true` | Windowed rendering (recommended for large trees) |
 | `cacheExpiryHours` | `24` | Cache TTL; `0` disables caching |
 | `treeFolder` | `CogniTree` | Vault folder holding generated trees |
+| `askContextMaxNodes` | `60` | Nodes included in the grounding context of an **Ask** question |
+| `askContextMaxChars` | `10000` | Character budget for that grounding context (protects small-context models) |
 
 Also: **Clear cache** (currently N cached generations) and **tree folder** relocation.
 
@@ -79,12 +83,13 @@ Also: **Clear cache** (currently N cached generations) and **tree folder** reloc
 
 ## The prompt system
 
-The four prompts from the spec are implemented verbatim in [`src/prompts.ts`](src/prompts.ts):
+The prompts from the spec are implemented verbatim in [`src/prompts.ts`](src/prompts.ts) — plus a fifth, follow-up chat prompt whose system message is assembled at runtime from a compact branch digest ([`src/ask.ts`](src/ask.ts)):
 
 1. **Discovery Prompt** — *"You are a polymathic taxonomist and knowledge graph engineer…"* — 3–7 domains, 3–5 children each, complexity ratings, connection hints, `suggested_starting_branch`. Strict JSON schema.
 2. **Expansion Prompt** — *"You are a knowledge graph engineer specializing in deep taxonomic expansion…"* — 5–10 granular children, sibling de-duplication context, `can_expand` + `estimated_depth` depth indicators.
 3. **Connection Discovery Prompt** — *"You are a knowledge graph analyst…"* — ranked candidate vault notes, `relationship_type` (parent-of / related-to / contrast-with…), High/Medium/Low priority, suggestions for concepts to create.
 4. **Batch Generation Prompt** — *"You are a batch knowledge expansion specialist…"* — complete subtree to a depth within a node budget (`path`-based hierarchical output).
+5. **Follow-up (Ask) Prompt** — *"You are CogniTree Ask…"* — a grounded tutor over the focused node's branch digest. Answers stay anchored in the digest (plus linked vault notes), keep Markdown short, and — when the answer proposes new sub-concepts — end with a `### Suggested children` bullet list that the chat can adopt into the tree.
 
 Responses are parsed tolerantly (markdown-fence stripping, trailing-comma repair, balanced-brace extraction) in [`src/parser.ts`](src/parser.ts).
 
@@ -152,6 +157,7 @@ Click any node once to grab keyboard focus for the list. The toolbar actions (**
 - **Create concept tree from selection** — uses the current editor selection as the root concept
 - **Refresh from vault** — reload trees if you edited notes by hand
 - **Reindex vault notes** — rebuild the connection index on demand
+- **Ask about selected concept** — grounded Q&A chat on the selected node (or the tree root)
 
 ## Screenshots
 
