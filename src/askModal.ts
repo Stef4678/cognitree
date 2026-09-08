@@ -48,22 +48,54 @@ const PRESETS: Preset[] = [
 	},
 ];
 
-/** Escape model text so no HTML the model emits can reach the DOM raw. */
-function escapeHtml(s: string): string {
-	return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+/** Element factory — content is always attached via textContent, never parsed as HTML. */
+function makeEl<K extends keyof HTMLElementTagNameMap>(tag: K, cls?: string): HTMLElementTagNameMap[K] {
+	const node = document.createElement(tag);
+	if (cls) node.className = cls;
+	return node;
 }
 
-/** Safe inline Markdown → HTML (escaped first, then our own tags only). */
-function inlineToHtml(s: string): string {
-	let out = escapeHtml(s);
-	out = out.replace(/`([^`\n]+)`/g, '<code>$1</code>');
-	out = out.replace(
-		/\[\[([^\]\n]+)\]\]/g,
-		(_m, t: string) => `<span class="ct-wl">${String(t).split('|')[0].trim()}</span>`
-	);
-	out = out.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-	out = out.replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g, '$1<em>$2</em>');
-	return out;
+const HEADING_TAGS = { 3: 'h3', 4: 'h4', 5: 'h5', 6: 'h6' } as const;
+
+/** Match one inline construct: `code`, [[wikilink]], **bold**, *italic*. */
+const INLINE_RE =
+	/(`[^`\n]+`)|(\[\[[^\]\n]+\]\])|(\*\*[^*\n]+\*\*)|(?<=^|[\s(])\*([^*\n]+)\*(?=[\s).,!?:;]|$)/g;
+
+/**
+ * Append inline Markdown to `container` as real DOM nodes. Every text
+ * fragment reaches the DOM through textContent / createTextNode, so model
+ * output can never inject markup.
+ */
+function renderInline(container: HTMLElement, text: string): void {
+	if (!text) return;
+	INLINE_RE.lastIndex = 0;
+	let last = 0;
+	for (let m = INLINE_RE.exec(text); m; m = INLINE_RE.exec(text)) {
+		if (m.index > last) {
+			container.appendChild(document.createTextNode(text.slice(last, m.index)));
+		}
+		last = m.index + m[0].length;
+		if (m[1]) {
+			const code = makeEl('code');
+			code.textContent = m[1].slice(1, -1);
+			container.appendChild(code);
+		} else if (m[2]) {
+			const wl = makeEl('span', 'ct-wl');
+			wl.textContent = m[2].slice(2, -2).split('|')[0].trim();
+			container.appendChild(wl);
+		} else if (m[3]) {
+			const b = makeEl('strong');
+			b.textContent = m[3].slice(2, -2);
+			container.appendChild(b);
+		} else if (m[4]) {
+			const em = makeEl('em');
+			em.textContent = m[4];
+			container.appendChild(em);
+		}
+	}
+	if (last < text.length) {
+		container.appendChild(document.createTextNode(text.slice(last)));
+	}
 }
 
 /** Render bounded chat Markdown into `root` (headings, lists, code, bold/italic). */
@@ -72,81 +104,57 @@ function renderChatMarkdown(root: HTMLElement, markdown: string): void {
 	if (!markdown) return;
 	const lines = markdown.replace(/\r\n/g, '\n').split('\n');
 
-	let html = '';
-	let codeBuf: string[] | null = null;
-	let listTag: 'ul' | 'ol' | null = null;
-	const closeList = () => {
-		if (listTag) {
-			html += `</${listTag}>`;
-			listTag = null;
-		}
-	};
-	const flushCode = () => {
-		if (codeBuf) {
-			html += `<pre class="ct-ask-code"><code>${codeBuf
-				.map((l) => escapeHtml(l))
-				.join('\n')}</code></pre>`;
-			codeBuf = null;
-		}
-	};
-
 	let i = 0;
 	while (i < lines.length) {
 		const raw = lines[i];
 		const t = raw.trim();
 
-		if (codeBuf !== null) {
-			if (/^```/.test(t)) {
-				flushCode();
-			} else {
-				codeBuf.push(raw);
-			}
+		if (!t) {
 			i++;
 			continue;
 		}
 		if (/^```/.test(t)) {
-			closeList();
-			codeBuf = [];
+			// Fenced code block: collect until the closing fence.
+			const buf: string[] = [];
 			i++;
-			continue;
-		}
-		if (!t) {
-			closeList();
-			i++;
+			while (i < lines.length && !/^```/.test(lines[i].trim())) {
+				buf.push(lines[i]);
+				i++;
+			}
+			i++; // skip the closing fence
+			const pre = makeEl('pre', 'ct-ask-code');
+			const codeEl = makeEl('code');
+			codeEl.textContent = buf.join('\n');
+			pre.appendChild(codeEl);
+			root.appendChild(pre);
 			continue;
 		}
 		const heading = raw.match(/^(#{1,6})\s+(.*)$/);
 		if (heading) {
-			closeList();
-			const level = Math.min(heading[1].length + 2, 6);
-			html += `<h${level}>${inlineToHtml(heading[2])}</h${level}>`;
+			const level = Math.min(heading[1].length + 2, 6) as keyof typeof HEADING_TAGS;
+			const h = makeEl(HEADING_TAGS[level]);
+			renderInline(h, heading[2]);
+			root.appendChild(h);
 			i++;
 			continue;
 		}
-		const ul = raw.match(/^\s*[-*+]\s+(.*)$/);
-		if (ul) {
-			if (listTag !== 'ul') {
-				closeList();
-				html += '<ul>';
-				listTag = 'ul';
+		const isUl = /^\s*[-*+]\s+/.test(raw);
+		const isOl = /^\s*\d+[.)]\s+/.test(raw);
+		if (isUl || isOl) {
+			const list = makeEl(isUl ? 'ul' : 'ol');
+			while (i < lines.length && lines[i].trim()) {
+				const line = lines[i].trim();
+				const item = line.match(/^(?:[-*+]|\d+[.)])\s+(.*)$/);
+				if (!item) break;
+				const li = makeEl('li');
+				renderInline(li, item[1]);
+				list.appendChild(li);
+				i++;
 			}
-			html += `<li>${inlineToHtml(ul[1])}</li>`;
-			i++;
-			continue;
-		}
-		const ol = raw.match(/^\s*\d+[.)]\s+(.*)$/);
-		if (ol) {
-			if (listTag !== 'ol') {
-				closeList();
-				html += '<ol>';
-				listTag = 'ol';
-			}
-			html += `<li>${inlineToHtml(ol[1])}</li>`;
-			i++;
+			root.appendChild(list);
 			continue;
 		}
 		// Paragraph: absorb until a blank line or another block start.
-		closeList();
 		const para = [raw.trim()];
 		i++;
 		while (
@@ -157,11 +165,10 @@ function renderChatMarkdown(root: HTMLElement, markdown: string): void {
 			para.push(lines[i].trim());
 			i++;
 		}
-		html += `<p>${para.map((p) => inlineToHtml(p)).join(' ')}</p>`;
+		const p = makeEl('p');
+		renderInline(p, para.join(' '));
+		root.appendChild(p);
 	}
-	flushCode();
-	closeList();
-	root.innerHTML = html;
 }
 
 export class AskModal extends Modal {
