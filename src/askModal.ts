@@ -61,24 +61,26 @@ const INLINE_RE =
 
 /**
  * Append inline Markdown to `container` as real DOM nodes, created with
- * Obsidian's `createEl`. Every text fragment reaches the DOM through
- * textContent / createTextNode, so model output can never inject markup.
+ * Obsidian's `createEl` / `createSpan` helpers only. Every text fragment
+ * reaches the DOM via those helpers (text content is set with `text:`),
+ * so model output can never inject markup — and no `document.*` DOM
+ * creation API is used anywhere.
  */
 function renderInline(container: HTMLElement, text: string): void {
 	if (!text) return;
 	INLINE_RE.lastIndex = 0;
 	let last = 0;
+	const appendText = (fragment: string): void => {
+		if (fragment) container.createSpan({ text: fragment });
+	};
 	for (let m = INLINE_RE.exec(text); m; m = INLINE_RE.exec(text)) {
-		if (m.index > last) {
-			container.appendChild(document.createTextNode(text.slice(last, m.index)));
-		}
+		appendText(text.slice(last, m.index));
 		last = m.index + m[0].length;
 		if (m[1]) {
 			const code = container.createEl('code');
 			code.textContent = m[1].slice(1, -1);
 		} else if (m[2]) {
-			const wl = container.createEl('span', { cls: 'ct-wl' });
-			wl.textContent = m[2].slice(2, -2).split('|')[0].trim();
+			container.createSpan({ cls: 'ct-wl', text: m[2].slice(2, -2).split('|')[0].trim() });
 		} else if (m[3]) {
 			const b = container.createEl('strong');
 			b.textContent = m[4];
@@ -87,9 +89,7 @@ function renderInline(container: HTMLElement, text: string): void {
 			em.textContent = m[6];
 		}
 	}
-	if (last < text.length) {
-		container.appendChild(document.createTextNode(text.slice(last)));
-	}
+	appendText(text.slice(last));
 }
 
 /** Render bounded chat Markdown into `root` (headings, lists, code, bold/italic). */
