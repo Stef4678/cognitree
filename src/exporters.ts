@@ -215,9 +215,11 @@ const NOTE_LINE_HEIGHT = 15;
 /**
  * Names that could not be drawn in full, wrapped as a note to put under the
  * drawing. An arc a few pixels wide cannot hold text and a box has its limits,
- * but the concept still has a name — it is listed rather than lost.
+ * but the concept still has a name — it is listed rather than lost. `reason`
+ * says why in the reader's terms ("too narrow to label" for a sunburst arc,
+ * "shown shortened" for a graph box).
  */
-function noteLines(names: string[], widthPx: number): string[] {
+function noteLines(names: string[], widthPx: number, reason: string): string[] {
 	if (names.length === 0) return [];
 	const perLine = Math.max(
 		24,
@@ -225,8 +227,8 @@ function noteLines(names: string[], widthPx: number): string[] {
 	);
 	const lines: string[] = [
 		names.length === 1
-			? '1 concept is too narrow to label:'
-			: `${names.length} concepts are too narrow to label:`,
+			? `1 concept is ${reason}:`
+			: `${names.length} concepts are ${reason}:`,
 	];
 	let current = '';
 	for (const name of names) {
@@ -861,7 +863,7 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 
 	// An arc a couple of pixels wide can never hold text, but the concept still
 	// has a name — list those under the drawing instead of losing them.
-	const note = noteLines(result.unlabelled, result.size);
+	const note = noteLines(result.unlabelled, result.size, 'too narrow to label');
 	if (note.length > 0) {
 		result.note = note;
 		result.height = result.size + note.length * NOTE_LINE_HEIGHT + 26;
@@ -1011,41 +1013,105 @@ export function buildJsonSnapshot(model: TreeModel): string {
 	return JSON.stringify({ root: model.root, node_count: nodes.length, nodes }, null, 2);
 }
 
-const NODE_H = 34;
-const LAYER_GAP = 70;
 /** Margin around the whole diagram. */
 const PAD = 24;
-/** Horizontal padding inside a node box, and the gap between sibling subtrees. */
+/** Horizontal padding inside a node box. */
 const NODE_PAD_X = 28;
+/** Vertical padding inside a box, and the gaps between subtrees and rows. */
+const NODE_PAD_Y = 10;
 const SIBLING_GAP = 20;
+const ROW_GAP = 36;
 const MIN_NODE_W = 96;
-/** A box may grow to this, then its label shrinks, and only then is ellipsised. */
-const MAX_NODE_W = 320;
+/** Width a label wraps to before the box may grow wider. */
+const TARGET_NODE_W = 220;
+/** Lines a node label may wrap onto. */
+const MAX_NODE_LINES = 3;
 const TREE_MIN_FONT = 9.5;
 /** Font sizes a node label may shrink through, largest first. */
 const TREE_FONTS = [12, 11, 10, 9.5];
+
+interface TreeLabel {
+	/** The lines as drawn; more than one when the name had to wrap. */
+	lines: string[];
+	font: number;
+	w: number;
+	h: number;
+	/** True when the name could not be shown in full and was shortened. */
+	shortened: boolean;
+}
 
 interface LayoutNode {
 	x: number;
 	y: number;
 	w: number;
-	/** The label as drawn (possibly ellipsised), and the size it is drawn at. */
-	text: string;
-	font: number;
+	label: TreeLabel;
 }
 
-/** The label as drawn for a node: shrunk to fit the box, then ellipsised. */
-function fitTreeLabel(name: string): { text: string; font: number } {
-	const budget = MAX_NODE_W - NODE_PAD_X;
-	const font =
-		TREE_FONTS.find((size) => estimateTextWidth(name, size) <= budget) ??
-		TREE_MIN_FONT;
-	if (estimateTextWidth(name, font) <= budget) return { text: name, font };
-	let cut = name.length;
-	while (cut > 1 && estimateTextWidth(`${name.slice(0, cut - 1)}…`, font) > budget) {
+/**
+ * Greedy word wrap measured in pixels. A word wider than the line is split,
+ * because a single very long token is still better broken than dropped.
+ */
+function wrapToWidth(text: string, maxWidth: number, font: number): string[] {
+	const words = text.split(/\s+/).filter(Boolean);
+	const lines: string[] = [];
+	let current = '';
+	for (const word of words) {
+		const candidate = current ? `${current} ${word}` : word;
+		if (estimateTextWidth(candidate, font) <= maxWidth) {
+			current = candidate;
+			continue;
+		}
+		if (current) lines.push(current);
+		current = '';
+		let rest = word;
+		while (rest.length > 1 && estimateTextWidth(rest, font) > maxWidth) {
+			let cut = rest.length - 1;
+			while (cut > 1 && estimateTextWidth(rest.slice(0, cut), font) > maxWidth) cut--;
+			lines.push(rest.slice(0, cut));
+			rest = rest.slice(cut);
+		}
+		current = rest;
+	}
+	if (current) lines.push(current);
+	return lines.length > 0 ? lines : [text];
+}
+
+/** Shorten `text` until it fits `maxWidth` at `font`, ending with an ellipsis. */
+function ellipsise(text: string, maxWidth: number, font: number): string {
+	let cut = text.length;
+	while (cut > 1 && estimateTextWidth(`${text.slice(0, cut - 1)}…`, font) > maxWidth) {
 		cut--;
 	}
-	return { text: `${name.slice(0, Math.max(1, cut - 1))}…`, font };
+	return `${text.slice(0, Math.max(1, cut - 1))}…`;
+}
+
+/**
+ * The label as drawn for a node: wrapped onto a few lines, at the largest font
+ * that lets the whole name fit. Only a name that cannot fit even at the floor
+ * font in the allowed lines is shortened — and then it is listed under the
+ * drawing, so the reader still gets the name.
+ */
+function fitTreeLabel(name: string): TreeLabel {
+	const budget = TARGET_NODE_W - NODE_PAD_X;
+	const box = (lines: string[], font: number, shortened: boolean): TreeLabel => {
+		const lineHeight = font * 1.25;
+		return {
+			lines,
+			font,
+			w: Math.min(TARGET_NODE_W, Math.max(MIN_NODE_W, Math.max(...lines.map((line) => estimateTextWidth(line, font))) + NODE_PAD_X)),
+			h: Math.round((lines.length - 1) * lineHeight + font * 1.02 + NODE_PAD_Y * 2),
+			shortened,
+		};
+	};
+	for (const font of TREE_FONTS) {
+		const lines = wrapToWidth(name, budget, font);
+		if (lines.length <= MAX_NODE_LINES) return box(lines, font, false);
+	}
+	// Still too long at the floor font: keep the first lines and ellipsise the last.
+	const font = TREE_MIN_FONT;
+	const lines = wrapToWidth(name, budget, font).slice(0, MAX_NODE_LINES);
+	lines[lines.length - 1] = ellipsise(`${lines[lines.length - 1]} …`, budget, font);
+	return box(lines, font, true);
 }
 
 /**
@@ -1065,19 +1131,27 @@ function fitTreeLabel(name: string): { text: string; font: number } {
 export function buildTreeSvg(model: TreeModel): string {
 	const nodes = model.nodes;
 	const depth = computeDepths(model);
-	const labels = new Map<string, { text: string; font: number }>();
+	const labels = new Map<string, TreeLabel>();
 	for (const name of nodes.keys()) labels.set(name, fitTreeLabel(name));
+	const labelOf = (name: string): TreeLabel => labels.get(name) ?? fitTreeLabel(name);
+	const boxW = (name: string): number => labelOf(name).w;
 
-	/** The label as drawn for a node, from the precomputed table. */
-	const labelOf = (name: string): { text: string; font: number } =>
-		labels.get(name) ?? fitTreeLabel(name);
-	const boxW = (name: string): number => {
-		const label = labelOf(name);
-		return Math.max(
-			MIN_NODE_W,
-			Math.min(MAX_NODE_W, estimateTextWidth(label.text, label.font) + NODE_PAD_X)
-		);
-	};
+	// Rows are as tall as the tallest box in them, so a wrapped label has room
+	// without pushing every other row down.
+	const rowHeight = new Map<number, number>();
+	for (const [name, label] of labels) {
+		const d = depth.get(name) ?? 0;
+		rowHeight.set(d, Math.max(rowHeight.get(d) ?? 0, label.h));
+	}
+	const rowTop = new Map<number, number>();
+	{
+		let y = PAD;
+		const maxRow = Math.max(0, ...rowHeight.keys());
+		for (let d = 0; d <= maxRow; d++) {
+			rowTop.set(d, y);
+			y += (rowHeight.get(d) ?? 0) + ROW_GAP;
+		}
+	}
 
 	/** Width a subtree needs, cycle-safe (hand-edited frontmatter can loop). */
 	const slots = new Map<string, number>();
@@ -1108,11 +1182,13 @@ export function buildTreeSvg(model: TreeModel): string {
 		if (open.has(name)) return 0;
 		open.add(name);
 		const slot = slots.get(name) ?? MIN_NODE_W;
-		const w = boxW(name);
+		const label = labelOf(name);
+		const w = label.w;
+		const y = (rowTop.get(depth.get(name) ?? 0) ?? PAD) + ((rowHeight.get(depth.get(name) ?? 0) ?? label.h) - label.h) / 2;
 		const children = (n.children ?? []).filter((child) => nodes.has(child));
 		if (children.length === 0) {
 			const x = left + (slot - w) / 2;
-			layout.set(name, { x, y: (depth.get(name) ?? 0) * LAYER_GAP, w, ...labelOf(name) });
+			layout.set(name, { x, y, w, label });
 			minX = Math.min(minX, x);
 			maxX = Math.max(maxX, x + w);
 			open.delete(name);
@@ -1134,7 +1210,7 @@ export function buildTreeSvg(model: TreeModel): string {
 			Math.max(0, children.length - 1) * SIBLING_GAP;
 		const centre = left + childrenW / 2;
 		const x = Math.max(left, Math.min(left + slot - w, centre - w / 2));
-		layout.set(name, { x, y: (depth.get(name) ?? 0) * LAYER_GAP, w, ...labelOf(name) });
+		layout.set(name, { x, y, w, label });
 		minX = Math.min(minX, x);
 		maxX = Math.max(maxX, x + w);
 		open.delete(name);
@@ -1146,13 +1222,15 @@ export function buildTreeSvg(model: TreeModel): string {
 
 	const maxDepth = Math.max(0, ...depth.values());
 	const totalW = Math.round(maxX - minX + PAD * 2);
-	const diagramH = Math.round(maxDepth * LAYER_GAP + NODE_H + PAD * 2);
+	const diagramH = Math.round(
+		(rowTop.get(maxDepth) ?? PAD) + (rowHeight.get(maxDepth) ?? 0) + PAD
+	);
 	// Names that had to be shortened are listed under the drawing, so no concept
 	// is left unnamed in the export.
-	const shortened = [...layout.entries()]
-		.filter(([name, node]) => node.text !== name)
+	const shortened = [...labels.entries()]
+		.filter(([name, label]) => label.shortened || label.lines.join(' ') !== name)
 		.map(([name]) => name);
-	const note = noteLines(shortened, totalW);
+	const note = noteLines(shortened, totalW, 'shown shortened');
 	const noteHeight = note.length > 0 ? note.length * NOTE_LINE_HEIGHT + 26 : 0;
 	const totalH = diagramH + noteHeight;
 	const shiftX = PAD - minX;
@@ -1165,7 +1243,7 @@ export function buildTreeSvg(model: TreeModel): string {
 			const to = layout.get(c);
 			if (!to) continue;
 			const x1 = from.x + from.w / 2;
-			const y1 = from.y + NODE_H;
+			const y1 = from.y + from.label.h;
 			const x2 = to.x + to.w / 2;
 			const y2 = to.y;
 			const my = (y1 + y2) / 2;
@@ -1179,10 +1257,19 @@ export function buildTreeSvg(model: TreeModel): string {
 	for (const n of nodes.values()) {
 		const l = layout.get(n.name);
 		if (!l) continue;
+		const label = l.label;
+		const tspans = label.lines
+			.map(
+				(line, i) =>
+					`<tspan x="${(l.w / 2).toFixed(1)}" dy="${
+						i === 0 ? -((label.lines.length - 1) * label.font * 1.25) / 2 + label.font * 0.27 : label.font * 1.25
+					}">${escapeXml(line)}</tspan>`
+			)
+			.join('');
 		boxes.push(
-			`<g data-node="${escapeXml(n.name)}" transform="translate(${l.x + shiftX}, ${l.y + PAD})">
-  <rect width="${l.w.toFixed(1)}" height="${NODE_H}" rx="8" fill="#f4f1ff" stroke="#b06cff" stroke-width="1"/>
-  <text x="${(l.w / 2).toFixed(1)}" y="${NODE_H / 2 + 4}" text-anchor="middle" font-size="${l.font}" fill="#3a3550">${escapeXml(l.text)}</text>
+			`<g data-node="${escapeXml(n.name)}" transform="translate(${l.x + shiftX}, ${l.y})">
+  <rect width="${l.w.toFixed(1)}" height="${label.h}" rx="8" fill="#f4f1ff" stroke="#b06cff" stroke-width="1"/>
+  <text x="${(l.w / 2).toFixed(1)}" y="${(label.h / 2).toFixed(1)}" text-anchor="middle" font-size="${label.font}" fill="#3a3550">${tspans}</text>
 </g>`
 		);
 	}

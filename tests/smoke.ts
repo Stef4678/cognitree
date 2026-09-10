@@ -1610,7 +1610,7 @@ import {
 			);
 		const svgBoxes = (
 			svg: string
-		): { name: string; x: number; y: number; w: number; h: number; font: number; text: string }[] => {
+		): { name: string; x: number; y: number; w: number; h: number; font: number; lines: string[] }[] => {
 			const decode = (value: string): string =>
 				value
 					.replace(/&apos;/g, "'")
@@ -1626,6 +1626,10 @@ import {
 				const rect = m[3].match(/<rect width="([\d.-]+)" height="([\d.-]+)"/);
 				const text = m[3].match(/<text[^>]*font-size="([\d.-]+)"[^>]*>([\s\S]*?)<\/text>/);
 				if (!rect) continue;
+				// A wrapped label is a list of tspans; a single-line one is bare text.
+				const tspans = text
+					? [...text[2].matchAll(/<tspan[^>]*>([\s\S]*?)<\/tspan>/g)].map((t) => decode(t[1]))
+					: [];
 				boxes.push({
 					name: decode(m[0].match(/data-node="([^"]*)"/)?.[1] ?? ''),
 					x: Number(m[1]),
@@ -1633,11 +1637,12 @@ import {
 					w: Number(rect[1]),
 					h: Number(rect[2]),
 					font: text ? Number(text[1]) : 12,
-					text: text ? decode(text[2]) : '',
+					lines: tspans.length > 0 ? tspans : text ? [decode(text[2])] : [],
 				});
 			}
 			return boxes;
 		};
+		const textOf = (box: { lines: string[] }): string => box.lines.join(' ');
 		const countOverlappingBoxes = (svg: string): string[] => {
 			const boxes = svgBoxes(svg);
 			const problems: string[] = [];
@@ -1649,7 +1654,7 @@ import {
 					const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
 					if (ox > 0 && oy > 0) {
 						problems.push(
-							`"${a.text}" overlaps "${b.text}" by ${ox.toFixed(0)}x${oy.toFixed(0)}px`
+							`"${textOf(a)}" overlaps "${textOf(b)}" by ${ox.toFixed(0)}x${oy.toFixed(0)}px`
 						);
 					}
 				}
@@ -1658,13 +1663,12 @@ import {
 		};
 		const labelsOutsideTheirBox = (svg: string): string[] =>
 			svgBoxes(svg)
-				.filter((box) => estimateTextWidth(box.text, box.font) > box.w - 8)
-				.map(
-					(box) =>
-						`"${box.text}" needs ${estimateTextWidth(box.text, box.font).toFixed(0)}px in ${box.w.toFixed(
-							0
-						)}px`
-				);
+				.filter((box) => {
+					const widest = Math.max(0, ...box.lines.map((line) => estimateTextWidth(line, box.font)));
+					const height = (box.lines.length - 1) * box.font * 1.25 + box.font * 1.02;
+					return widest > box.w - 8 || height > box.h;
+				})
+				.map((box) => `"${textOf(box)}" does not fit its ${box.w.toFixed(0)}x${box.h} box`);
 
 		// Shaped like the reported tree: wide, uneven, and full of long names.
 		const trunk = 'Energy';
@@ -1695,9 +1699,22 @@ import {
 			0,
 			'buildTreeSvg: every label is drawn inside its own box'
 		);
+		// A long name wraps instead of being shortened, so it stays readable.
+		const wrapped = svgBoxes(layeredSvg).find(
+			(box) => box.name === 'Elastic Potential Energy In Series And Parallel Spring Configurations'
+		);
+		assert(!!wrapped, 'buildTreeSvg: the long name gets a box');
 		assert(
-			layeredSvg.includes('Green\u2019s Functions For Laplace\u2019s Equation'),
-			'buildTreeSvg: a name that fits the widest box is drawn in full'
+			!!wrapped && wrapped.lines.length > 1,
+			'buildTreeSvg: a long name wraps onto several lines'
+		);
+		assert(
+			!!wrapped && textOf(wrapped) === wrapped.name,
+			'buildTreeSvg: a wrapped name is drawn in full, not shortened'
+		);
+		assert(
+			!layeredSvg.includes('shown shortened'),
+			'buildTreeSvg: nothing is shortened when every name can wrap'
 		);
 		const boxes = svgBoxes(layeredSvg);
 		assert(
@@ -1710,8 +1727,9 @@ import {
 				layered.nodes.size
 			})`
 		);
-		// A label too long for any box is shortened, shrunk, and listed below.
-		const huge = `A concept name so long that no box can hold it ${'very '.repeat(8)}long`;
+		// A name with no chance of fitting, however it wraps, is shortened and
+		// listed under the drawing — never simply dropped.
+		const huge = `A concept name so long that no box can hold it ${'very '.repeat(24)}long`;
 		const hugeModel: TreeModel = {
 			root: 'Root',
 			folder: 'f',
@@ -1729,14 +1747,15 @@ import {
 			0,
 			'buildTreeSvg: a huge name is still drawn inside its box'
 		);
-		assert(hugeSvg.includes('too narrow to label'), 'buildTreeSvg: the shortened name is listed');
+		assert(hugeSvg.includes('shown shortened'), 'buildTreeSvg: the shortened name is listed');
 		assert(
 			hugeSvg.includes(`data-node="${huge}"`),
 			'buildTreeSvg: the full name survives in data-node'
 		);
 	}
 
-	// The width model itself, pinned to real text measured in Inter and Segoe UI	// at label size (10.5px). Trimming the per-character table would make the
+	// The width model itself, pinned to real text measured in Inter and Segoe UI
+	// at label size (10.5px). Trimming the per-character table would make the
 	// containment checks above pass while labels spill in a real viewer.
 	for (const [name, measured] of [
 		['Work-Energy Theorem', 104.8],
