@@ -10,6 +10,8 @@ import { ConceptGenerator } from '../src/generator';
 import { computeDepths } from '../src/exporters';
 import { addCards, gradeCard, reviewStats } from '../src/review';
 import { buildGraph, collectVaultNotes, sourceMap } from '../src/vaultGraph';
+import CogniTreePlugin from '../src/main';
+import { VIEW_TYPE } from '../src/treeView';
 import { DEFAULT_SETTINGS, type DiscoveryResult, type TreeNode, type TreeModel } from '../src/types';
 
 let failures = 0;
@@ -589,6 +591,65 @@ async function main(): Promise<void> {
 		}
 		assert(reachedApi, 'refresh asks the model instead of returning the cached text');
 		eq(calls.get, 1, 'refresh bypasses the prompt cache (one read, from the first call)');
+	}
+
+	// ---------------------------------------------------------------- view activation
+	{
+		// Clicking the ribbon twice before the first tab has finished loading used
+		// to open TWO CogniTree tabs in the right sidebar (both look identical).
+		// This models Obsidian: a leaf only reports its view type once
+		// setViewState has resolved.
+		const makeLeaf = () => {
+			const leaf: any = {
+				type: '',
+				setViewState: async (state: { type: string }) => {
+					await new Promise((resolve) => setTimeout(resolve, 5));
+					leaf.type = state.type;
+				},
+				detach: () => {
+					leaf.detached = true;
+				},
+			};
+			return leaf;
+		};
+		const leaves: any[] = [];
+		const app: any = {
+			workspace: {
+				getLeavesOfType: (type: string) => leaves.filter((leaf) => leaf.type === type),
+				getRightLeaf: () => {
+					const leaf = makeLeaf();
+					leaves.push(leaf);
+					return leaf;
+				},
+				setActiveLeaf: () => undefined,
+			},
+		};
+		const plugin: any = Object.create(CogniTreePlugin.prototype);
+		plugin.app = app;
+		plugin.data = {};
+		plugin.manifest = { id: 'cognitree' };
+
+		await Promise.all([plugin.activateView(true), plugin.activateView(true)]);
+		eq(leaves.length, 1, 'two rapid activateView calls open one tab, not two');
+
+		await plugin.activateView(true);
+		eq(leaves.length, 1, 'a later activateView reuses the open tab');
+		eq(leaves[0].type, VIEW_TYPE, 'the tab ends up holding the CogniTree view');
+
+		// A layout saved by an older version can already contain duplicates; the
+		// cleanup command must close exactly the extras.
+		const extra = makeLeaf();
+		extra.type = VIEW_TYPE;
+		const alsoExtra = makeLeaf();
+		alsoExtra.type = VIEW_TYPE;
+		leaves.push(extra, alsoExtra);
+		eq(plugin.closeExtraPanels(), 2, 'closeExtraPanels reports how many it closed');
+		assert(extra.detached === true && alsoExtra.detached === true, 'closeExtraPanels detaches the extras');
+		eq(
+			leaves.filter((leaf) => !leaf.detached).length,
+			1,
+			'closeExtraPanels keeps exactly one panel'
+		);
 	}
 
 	// ---------------------------------------------------------------- cycle safety

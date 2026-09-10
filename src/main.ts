@@ -32,6 +32,14 @@ export default class CogniTreePlugin extends Plugin {
 		return leaves.length > 0 ? (leaves[0].view as ConceptTreeView) : null;
 	}
 
+	/**
+	 * In-flight `activateView` call. A leaf only reports its view type once
+	 * `setViewState` has resolved, so without this a second trigger during that
+	 * window (a double-clicked ribbon icon, a hotkey, the startup auto-open)
+	 * opens a second, identical tab in the sidebar.
+	 */
+	private activation: Promise<void> | null = null;
+
 	async onload(): Promise<void> {
 		await this.loadAll();
 
@@ -131,6 +139,18 @@ export default class CogniTreePlugin extends Plugin {
 			callback: () => void this.activateView().then(() => this.treeView?.openVaultTreeDialog()),
 		});
 		this.addCommand({
+			id: 'close-extra-panels',
+			name: 'Close extra CogniTree panels',
+			// Only offered when there is actually something to clean up.
+			checkCallback: (checking) => {
+				if (this.app.workspace.getLeavesOfType(VIEW_TYPE).length < 2) return false;
+				if (!checking) {
+					new Notice(`Closed ${this.closeExtraPanels()} extra CogniTree panel(s).`);
+				}
+				return true;
+			},
+		});
+		this.addCommand({
 			id: 'ask-about-selected',
 			name: 'Ask about selected concept',
 			checkCallback: (checking) => {
@@ -143,11 +163,17 @@ export default class CogniTreePlugin extends Plugin {
 
 		this.addSettingTab(new CogniTreeSettingTab(this));
 
-		// Re-open persisted view after layout is ready (only if the user used it before).
+		// Re-open persisted view after layout is ready (only if the user used it before),
+		// but only once the layout has actually finished restoring — checking too
+		// early is the other way this view ends up open twice (Obsidian restores
+		// the sidebar tab itself, then this code added a second one).
 		this.app.workspace.onLayoutReady(() => {
-			if (this.data.lastTree && this.app.workspace.getLeavesOfType(VIEW_TYPE).length === 0) {
-				void this.activateView(false);
-			}
+			if (!this.data.lastTree) return;
+			window.setTimeout(() => {
+				if (this.app.workspace.getLeavesOfType(VIEW_TYPE).length === 0) {
+					void this.activateView(false);
+				}
+			}, 300);
 		});
 	}
 
@@ -244,10 +270,35 @@ export default class CogniTreePlugin extends Plugin {
 			if (focus) this.app.workspace.setActiveLeaf(existing[0], { focus: true });
 			return;
 		}
+		// Wait for a leaf that is already being created instead of adding another.
+		if (this.activation) {
+			await this.activation;
+			if (focus) {
+				const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE)[0];
+				if (leaf) this.app.workspace.setActiveLeaf(leaf, { focus: true });
+			}
+			return;
+		}
 		const leaf = this.app.workspace.getRightLeaf(false);
 		if (!leaf) return;
-		await leaf.setViewState({ type: VIEW_TYPE, active: focus });
+		this.activation = leaf.setViewState({ type: VIEW_TYPE, active: focus });
+		try {
+			await this.activation;
+		} finally {
+			this.activation = null;
+		}
 		if (focus) this.app.workspace.setActiveLeaf(leaf, { focus: true });
+	}
+
+	/**
+	 * Detach every CogniTree panel except the first and return how many were
+	 * closed. Useful when an older version already saved duplicate tabs into the
+	 * workspace layout — Obsidian will keep restoring those until they are closed.
+	 */
+	closeExtraPanels(): number {
+		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
+		for (const leaf of leaves.slice(1)) leaf.detach();
+		return Math.max(0, leaves.length - 1);
 	}
 
 	async openSettings(): Promise<void> {
