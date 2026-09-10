@@ -25,6 +25,7 @@ import {
 	sanitizeDeepDive,
 } from './notebody';
 import { cachedFrontmatter } from './indexer';
+import { ApiError } from './api';
 import { REVIEW_DATA_VERSION, newReviewData, type ReviewData } from './review';
 
 /** Options for `ConceptStore.writeNode`. */
@@ -250,6 +251,7 @@ export class ConceptStore {
 			deepDive = extractDeepDive(await this.app.vault.cachedRead(existing));
 		}
 		if (deepDive) node.deepened = node.deepened || Date.now();
+		else if (deepDive === '') node.deepened = 0; // region gone (hand-deleted): drop a stale flag
 		const content = this.noteContent(node, deepDive ?? null);
 		if (existing instanceof TFile) {
 			await this.app.vault.modify(existing, content);
@@ -397,15 +399,20 @@ export class ConceptStore {
 		result: DiscoveryResult,
 		baseFolder: string,
 		sources: Map<string, string>,
-		rootSource?: string
+		rootSource?: string,
+		rootNameOverride?: string
 	): Promise<{ root: string; created: TreeNode[]; linked: number; skipped: string[] }> {
 		this.setBaseFolder(baseFolder);
-		const rootName = titleTrim(result.concept || 'Concept');
+		// The name the user typed wins over whatever the model echoed back.
+		const rootName = titleTrim(rootNameOverride || result.concept || 'Concept');
 		await this.ensureBaseFolder();
 		const folder = this.treeFolder(rootName);
-		if (!(await this.app.vault.adapter.exists(folder))) {
-			await this.app.vault.createFolder(folder);
+		// Never grow into an existing tree folder: that would mix two trees and
+		// shadow nodes whose concept names collide.
+		if (await this.app.vault.adapter.exists(folder)) {
+			throw new ApiError(`A tree named "${rootName}" already exists — choose another name.`);
 		}
+		await this.app.vault.createFolder(folder);
 
 		const now = Date.now();
 		const created: TreeNode[] = [];
@@ -447,6 +454,11 @@ export class ConceptStore {
 				// Only a name that exists in the candidate list may become a link.
 				const wanted = String(child.source ?? '').trim();
 				const sourcePath = wanted ? sources.get(normalizeKey(wanted)) : undefined;
+				// Use the note's real name for the wikilink, not the model's
+				// spelling, so the link lands on the intended note.
+				const sourceName = sourcePath
+					? (sourcePath.split('/').pop() ?? '').replace(/\.md$/, '')
+					: undefined;
 				if (sourcePath) linked++;
 				const node: TreeNode = {
 					name: childName,
@@ -454,11 +466,11 @@ export class ConceptStore {
 					domain: domainName,
 					description:
 						child.description ||
-						(sourcePath ? `Points at your note "${wanted}".` : ''),
+						(sourceName ? `Points at your note "${sourceName}".` : ''),
 					complexity: normalizeComplexity(child.complexity),
 					canExpand: toBool(child.can_expand, !sourcePath),
 					estimatedDepth: toInt(child.estimated_depth, 4),
-					connections: sourcePath ? [wanted] : (child.connections || []).filter(Boolean),
+					connections: sourceName ? [sourceName] : (child.connections || []).filter(Boolean),
 					children: [],
 					path: `${rootPath}/${slugify(domainName)}/${slugify(childName)}`,
 					created: now,

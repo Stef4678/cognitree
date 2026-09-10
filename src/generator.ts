@@ -66,12 +66,17 @@ export class ConceptGenerator {
 		kind: string,
 		system: string,
 		user: string,
-		onDelta?: (d: string) => void
+		onDelta?: (d: string) => void,
+		opts: { noCache?: boolean } = {}
 	): Promise<string> {
 		const s = this.settings();
-		const cached = await this.cache.get(kind, user, s.model);
-		if (cached !== null && typeof cached === 'string') {
-			return cached;
+		// A "refresh" action must really ask the model: serving the cached text
+		// would make it look like nothing happened.
+		if (!opts.noCache) {
+			const cached = await this.cache.get(kind, user, s.model);
+			if (cached !== null && typeof cached === 'string') {
+				return cached;
+			}
 		}
 		const messages: ChatMessage[] = [
 			{ role: 'system', content: system },
@@ -328,7 +333,7 @@ export class ConceptGenerator {
 	async deepen(
 		node: TreeNode,
 		model: TreeModel,
-		opts: { instruction?: string; onDelta?: (d: string) => void } = {}
+		opts: { instruction?: string; refresh?: boolean; onDelta?: (d: string) => void } = {}
 	): Promise<string> {
 		const s = this.settings();
 		const digest = buildBranchDigest(model, node.name, s.askContextMaxNodes, s.askContextMaxChars);
@@ -344,7 +349,9 @@ export class ConceptGenerator {
 			digest: digest.text,
 			instruction: opts.instruction,
 		});
-		const raw = await this.runPrompt('deepen', prompt.system, prompt.user, opts.onDelta);
+		const raw = await this.runPrompt('deepen', prompt.system, prompt.user, opts.onDelta, {
+			noCache: !!opts.refresh,
+		});
 		return sanitizeDeepDive(raw);
 	}
 
@@ -399,7 +406,10 @@ export class ConceptGenerator {
 			async (node) => {
 				try {
 					this.progress(opts.onProgress, done, targets.length, `Deep dive: "${node.name}"…`);
-					const md = await this.deepen(node, model, { onDelta: opts.onDelta });
+					const md = await this.deepen(node, model, {
+						onDelta: opts.onDelta,
+						refresh: opts.refresh,
+					});
 					if (!md) throw new ApiError('the model returned no content');
 					await this.store.setDeepDive(node, md);
 					deepened++;
@@ -435,7 +445,12 @@ export class ConceptGenerator {
 	// ---------------------------------------------------------------- 7. Review cards
 
 	/** Generate Q/A cards for one node (JSON prompt, validated and trimmed). */
-	async cards(node: TreeNode, model: TreeModel, count: number): Promise<CardDraft[]> {
+	async cards(
+		node: TreeNode,
+		model: TreeModel,
+		count: number,
+		opts: { noCache?: boolean } = {}
+	): Promise<CardDraft[]> {
 		const s = this.settings();
 		const digest = buildBranchDigest(model, node.name, s.askContextMaxNodes, s.askContextMaxChars);
 		const deepDive = await this.store.readDeepDive(node);
@@ -451,7 +466,9 @@ export class ConceptGenerator {
 			context,
 			count,
 		});
-		const raw = await this.runPrompt('cards', prompt.system, prompt.user);
+		const raw = await this.runPrompt('cards', prompt.system, prompt.user, undefined, {
+			noCache: !!opts.noCache,
+		});
 		const parsed = this.parse<{ cards?: CardDraft[] }>(raw, 'review cards');
 		return (parsed.cards ?? [])
 			.filter((c) => c && String(c.question ?? '').trim() && String(c.answer ?? '').trim())
@@ -508,7 +525,7 @@ export class ConceptGenerator {
 		await this.runBounded(targets, 3, async (node) => {
 			try {
 				this.progress(opts.onProgress, done, targets.length, `Cards: "${node.name}"…`);
-				const drafts = await this.cards(node, model, opts.perNode);
+				const drafts = await this.cards(node, model, opts.perNode, { noCache: !!opts.refresh });
 				if (drafts.length > 0) {
 					const res = addCards(data, node.name, drafts, Date.now(), opts.refresh);
 					added += res.added;

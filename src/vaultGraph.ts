@@ -146,13 +146,20 @@ export function collectVaultNotes(app: App, opts: { excludeFolder: string }): Gr
 	for (const file of app.vault.getMarkdownFiles()) {
 		if (excluded && (file.path === excluded || file.path.startsWith(excluded + '/'))) continue;
 		const cache = app.metadataCache.getFileCache(file);
+		// `frontmatter.tags` is legitimate YAML: a list, a single string or a
+		// number. Spreading a bare string would turn it into one tag per
+		// character, so normalise it first.
+		const rawTags = cache?.frontmatter?.tags;
+		const frontmatterTags = Array.isArray(rawTags) ? rawTags : rawTags ? [rawTags] : [];
+		const inlineTags = (cache?.tags ?? []).map((t) => t.tag);
 		const tags = [
-			...(cache?.frontmatter?.tags ?? []),
-			...(cache?.tags?.map((t) => t.tag) ?? []),
-		]
-			.map((t) => String(t).trim())
-			.filter(Boolean)
-			.map((t) => (t.startsWith('#') ? t : `#${t}`));
+			...new Set(
+				[...frontmatterTags, ...inlineTags]
+					.map((t) => String(t).trim())
+					.filter(Boolean)
+					.map((t) => (t.startsWith('#') ? t : `#${t}`))
+			),
+		];
 		raw.push({
 			name: file.basename,
 			path: file.path,

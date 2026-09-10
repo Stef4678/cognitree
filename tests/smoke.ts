@@ -429,6 +429,14 @@ import {
 		'notebody: hand edits inside the region survive extraction'
 	);
 	assert(extractRegion(body, '<!-- nope -->') === '', 'notebody: unknown marker → empty');
+	assert(
+		extractDeepDive(
+			['# X', '', DEEP_DIVE_HEADING, DEEP_DIVE_MARKER, '### A', '## Hand-written', 'text', '## Connections', '- [[Y]]'].join(
+				'\n'
+			)
+		).includes('Hand-written'),
+		'notebody: only the plugin’s own sections end the region'
+	);
 
 	const cleaned = sanitizeDeepDive(
 		'---\nconcept: "X"\n---\n## Deep dive\n<!-- cognitree:deep-dive -->\n### A\n\ntext'
@@ -436,7 +444,18 @@ import {
 	assert(!cleaned.includes('---'), 'sanitize: frontmatter stripped');
 	assert(!cleaned.includes('## Deep dive') && !cleaned.includes('cognitree:deep-dive'), 'sanitize: heading + marker stripped');
 	assert(cleaned.startsWith('### A'), 'sanitize: keeps the first real line');
-	assert(sanitizeDeepDive('# Title\n\n## Sub\n\ntext').startsWith('## Sub'), 'sanitize: drops a top-level H1');
+	assert(
+		sanitizeDeepDive('# Title\n\n## Sub\n\ntext').startsWith('### Sub'),
+		'sanitize: drops a top-level H1 and demotes a stray H2'
+	);
+	assert(
+		sanitizeDeepDive('## Examples\n\n- One') === '### Examples\n\n- One',
+		'sanitize: an H2 is demoted so it cannot end the region'
+	);
+	assert(
+		sanitizeDeepDive('### Already fine\n\n- One').startsWith('### Already fine'),
+		'sanitize: H3+ headings are left alone'
+	);
 	assert(sanitizeDeepDive('# Title\n\n## Deep dive\n\ntext').startsWith('text'), 'sanitize: drops an echoed region heading');
 	assert(sanitizeDeepDive('') === '' && sanitizeDeepDive('   \n\n ') === '', 'sanitize: empty stays empty');
 	assert(sanitizeDeepDive('a\n\n\n\n\nb') === 'a\n\nb', 'sanitize: collapses blank runs');

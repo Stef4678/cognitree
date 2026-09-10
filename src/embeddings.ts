@@ -35,6 +35,12 @@ export const EMBEDDING_STORE_VERSION = 1;
 export const EMBED_BATCH_SIZE = 32;
 /** Upper bound on cached vectors (oldest mtimes are pruned first). */
 export const MAX_EMBEDDING_RECORDS = 20000;
+/**
+ * Batches between two persistence passes. Rewriting the whole JSON store after
+ * every batch would be O(n²) on a large vault; every 8 batches (256 notes) is
+ * a compromise between crash safety and write volume.
+ */
+export const PERSIST_EVERY_BATCHES = 8;
 
 export function emptyStore(): EmbeddingStore {
 	return { version: EMBEDDING_STORE_VERSION, model: '', records: {} };
@@ -220,6 +226,7 @@ export class SemanticIndex {
 		}
 
 		let done = 0;
+		let batches = 0;
 		for (let i = 0; i < batch.length; i += EMBED_BATCH_SIZE) {
 			if (opts.signal?.aborted) break;
 			const chunk = batch.slice(i, i + EMBED_BATCH_SIZE);
@@ -259,9 +266,11 @@ export class SemanticIndex {
 				console.warn('CogniTree: embedding batch failed', err);
 			}
 			done += chunk.length;
-			// Persist per batch so a long run (or a closed app) keeps its work.
-			await this.persist();
+			batches++;
+			// Persist periodically so a long run (or a closed app) keeps its work.
+			if (batches % PERSIST_EVERY_BATCHES === 0) await this.persist();
 		}
+		await this.persist();
 		opts.onProgress?.({ done, total: batch.length, label: 'Semantic index updated.' });
 		return result;
 	}

@@ -75,6 +75,8 @@ export function buildJsonSnapshot(model: TreeModel): string {
 		connections: n.connections,
 		children: n.children,
 		path: n.path,
+		deepened: n.deepened ?? 0,
+		source: n.source ?? null,
 	}));
 	return JSON.stringify({ root: model.root, node_count: nodes.length, nodes }, null, 2);
 }

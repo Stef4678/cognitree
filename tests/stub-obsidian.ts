@@ -114,6 +114,24 @@ class FakeFileManager {
 }
 
 /**
+ * In-memory metadataCache. Notes without a registered cache behave like
+ * unindexed files (null), which is what the store's raw-parse fallback covers.
+ */
+export class FakeMetadataCache {
+	private caches = new Map<string, unknown>();
+	resolvedLinks: Record<string, Record<string, number>> = {};
+
+	set(path: string, cache: unknown): void {
+		this.caches.set(path, cache);
+	}
+
+	getFileCache = (file: TFile): unknown => this.caches.get(file.path) ?? null;
+	getFirstLinkpathDest = (): null => null;
+	on = (): Record<string, never> => ({});
+	offref = (): void => undefined;
+}
+
+/**
  * A fake `App`. `metadataCache.getFileCache` returns null on purpose: the
  * store then falls back to parsing the raw frontmatter of every note, which is
  * the same code path used for notes Obsidian hasn't indexed yet.
@@ -124,12 +142,7 @@ export function makeApp(): any {
 		vault,
 		fileManager: new FakeFileManager(vault),
 		workspace: { getLeaf: () => ({ openFile: async () => undefined }) },
-		metadataCache: {
-			getFileCache: () => null,
-			getFirstLinkpathDest: () => null,
-			on: () => ({}),
-			offref: () => undefined,
-		},
+		metadataCache: new FakeMetadataCache(),
 	};
 	return app;
 }

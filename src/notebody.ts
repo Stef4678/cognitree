@@ -11,7 +11,9 @@
  *   <!-- cognitree:deep-dive -->
  *   …generated Markdown, freely editable by hand…
  *
- * Hand edits inside the region are preserved verbatim on the next rewrite.
+ * The region runs until the next section the plugin itself owns (`## Connections`
+ * or `## Meta`) or the end of the file. Hand edits and extra headings inside it
+ * are preserved verbatim on the next rewrite.
  */
 
 export const DEEP_DIVE_HEADING = '## Deep dive';
@@ -19,6 +21,13 @@ export const DEEP_DIVE_MARKER = '<!-- cognitree:deep-dive -->';
 
 /** Hard cap for a generated region — keeps one bad response from bloating a note. */
 export const MAX_DEEP_DIVE_CHARS = 12000;
+
+/**
+ * The only headings that end a managed region: the plugin's own sections.
+ * Anything else (including a hand-written `## Notes`) stays inside the region,
+ * so it is carried over instead of being dropped on the next rewrite.
+ */
+const REGION_TERMINATORS = [/^##\s+connections\s*$/i, /^##\s+meta\s*$/i];
 
 /** Body text of a marker-delimited region, trimmed ('' when the marker is absent). */
 export function extractRegion(body: string, marker: string): string {
@@ -28,7 +37,7 @@ export function extractRegion(body: string, marker: string): string {
 	if (start === -1) return '';
 	const out: string[] = [];
 	for (let i = start + 1; i < lines.length; i++) {
-		if (/^##\s/.test(lines[i])) break; // the next H2 ends the region
+		if (REGION_TERMINATORS.some((re) => re.test(lines[i].trim()))) break;
 		out.push(lines[i]);
 	}
 	return out.join('\n').trim();
@@ -61,7 +70,10 @@ export function sanitizeDeepDive(raw: string): string {
 		if (trimmed === DEEP_DIVE_MARKER) continue;
 		if (trimmed.toLowerCase() === DEEP_DIVE_HEADING.toLowerCase()) continue;
 		if (/^#\s/.test(trimmed)) continue;
-		lines.push(line.replace(/\s+$/, ''));
+		// A "## " heading inside the region would read as the start of the next
+		// section and take the rest of the deep dive with it, so demote it.
+		const demoted = /^(\s*)##(\s+)/.test(line) ? line.replace(/^(\s*)##(\s+)/, '$1###$2') : line;
+		lines.push(demoted.replace(/\s+$/, ''));
 	}
 	while (lines.length > 0 && !lines[0].trim()) lines.shift();
 

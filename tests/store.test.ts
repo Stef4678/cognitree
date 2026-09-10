@@ -9,7 +9,7 @@ import { ConceptStore } from '../src/store';
 import { ConceptGenerator } from '../src/generator';
 import { computeDepths } from '../src/exporters';
 import { addCards, gradeCard, reviewStats } from '../src/review';
-import { buildGraph, sourceMap } from '../src/vaultGraph';
+import { buildGraph, collectVaultNotes, sourceMap } from '../src/vaultGraph';
 import { DEFAULT_SETTINGS, type DiscoveryResult, type TreeNode, type TreeModel } from '../src/types';
 
 let failures = 0;
@@ -361,6 +361,15 @@ async function main(): Promise<void> {
 			'hand edits inside the deep dive survive a rewrite'
 		);
 
+		// A model that emits an H2 inside the section must not lose the whole
+		// region on the next rewrite.
+		await store.setDeepDive(reloaded, '## Examples\n\n- One\n- Two');
+		await store.addConnectionLink(reloaded, 'Ballots');
+		assert(
+			(await store.readDeepDive(reloaded)).includes('- Two'),
+			'a deep dive containing an H2 survives the next rewrite'
+		);
+
 		await store.setDeepDive(reloaded, null);
 		assert(!app.vault.files.get(reloaded.file)!.includes('## Deep dive'), 'setDeepDive(null) removes the region');
 		assert(!reloaded.deepened, 'removing clears the deepened flag');
@@ -433,7 +442,7 @@ async function main(): Promise<void> {
 				{
 					name: 'Origins',
 					children: [
-						{ name: 'Ancient Greece', description: 'Early practice.', source: 'Greek Democracy' },
+						{ name: 'Ancient Greece', description: 'Early practice.', source: 'greek democracy' },
 						{ name: 'Selection by lot', description: '', source: 'Sortition' },
 						{ name: 'Hallucinated note', description: 'x', source: 'No Such Note' },
 						{ name: 'New concept', description: 'Generated child.' },
@@ -494,6 +503,92 @@ async function main(): Promise<void> {
 			!app.vault.files.has('CogniTree/Democracy Notes/Ancient Greece.md'),
 			'it removes the pointer note it created'
 		);
+
+		// Growing a second tree into the same folder would mix two trees.
+		let rejected = false;
+		try {
+			await store.createVaultTree(result, 'CogniTree', sourceMap(graph));
+		} catch {
+			rejected = true;
+		}
+		assert(rejected, 'createVaultTree refuses to grow into an existing tree folder');
+
+		// The name the caller asked for wins over the model's echo.
+		const renamed = await store.createVaultTree(
+			result,
+			'CogniTree',
+			sourceMap(graph),
+			undefined,
+			'My Notes Tree'
+		);
+		eq(renamed.root, 'My Notes Tree', 'the requested tree name is used for the folder and root');
+		assert(
+			app.vault.files.has('CogniTree/My Notes Tree/My Notes Tree.md'),
+			'the renamed tree gets its own folder'
+		);
+	}
+
+	// ---------------------------------------------------------------- vault graph from metadata
+	{
+		const app = makeApp();
+		app.vault.files.set('Notes/One.md', '# One\n');
+		app.vault.files.set('Notes/Two.md', '# Two\n');
+		app.vault.files.set('CogniTree/Democracy/X.md', '# X\n');
+		// A single string is legitimate YAML for `tags:` — it must not be spread
+		// into one tag per character.
+		app.metadataCache.set('Notes/One.md', {
+			frontmatter: { tags: 'research' },
+			tags: [{ tag: '#inline' }, { tag: 'inline' }],
+		});
+		app.metadataCache.set('Notes/Two.md', { frontmatter: { tags: ['#research', 'methods'] }, tags: [] });
+		app.metadataCache.resolvedLinks = { 'Notes/One.md': { 'Notes/Two.md': 1 } };
+
+		const graph = collectVaultNotes(app, { excludeFolder: 'CogniTree' });
+		const one = graph.find((n) => n.path === 'Notes/One.md')!;
+		const two = graph.find((n) => n.path === 'Notes/Two.md')!;
+		eq(one.tags.join(','), '#research,#inline', 'a string frontmatter tag is not spread into characters');
+		eq(two.tags.join(','), '#research,#methods', 'array tags are normalised with a leading #');
+		eq(two.backlinks, 1, 'resolved links become graph edges');
+		assert(
+			!graph.some((n) => n.path.startsWith('CogniTree/')),
+			'the tree folder is excluded from the vault graph'
+		);
+	}
+
+	// ---------------------------------------------------------------- prompt cache vs refresh
+	{
+		const app = makeApp();
+		const store = new ConceptStore(app);
+		await store.createDiscoveryTree(DISCOVERY, 'CogniTree');
+		const model = (await store.loadTree('Democracy'))!;
+		const node = model.nodes.get('Direct Democracy')!;
+		const calls = { get: 0, set: 0 };
+		const cache: any = {
+			get: async () => {
+				calls.get++;
+				return 'CACHED DEEP DIVE';
+			},
+			set: async () => {
+				calls.set++;
+			},
+		};
+		const gen: any = new ConceptGenerator(
+			app,
+			store,
+			{ search: () => [] } as any,
+			() => DEFAULT_SETTINGS,
+			cache
+		);
+		eq(await gen.deepen(node, model), 'CACHED DEEP DIVE', 'a deep dive run may be served from the cache');
+
+		let reachedApi = false;
+		try {
+			await gen.deepen(node, model, { refresh: true });
+		} catch {
+			reachedApi = true; // the test vault has no network, so this proves we asked the API
+		}
+		assert(reachedApi, 'refresh asks the model instead of returning the cached text');
+		eq(calls.get, 1, 'refresh bypasses the prompt cache (one read, from the first call)');
 	}
 
 	// ---------------------------------------------------------------- cycle safety

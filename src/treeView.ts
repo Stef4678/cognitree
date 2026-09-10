@@ -722,6 +722,9 @@ export class ConceptTreeView extends ItemView {
 			const md = await this.plugin.generator.deepen(node, this.model, {
 				onDelta: (d) =>
 					this.setBusy(true, `Writing deep dive for "${name}"… ${d.slice(-40)}`),
+				// Replacing an existing deep dive must ask the model, not replay
+				// a cached answer for the same prompt.
+				refresh: !!node.deepened,
 			});
 			if (!md) throw new ApiError('The model returned no content for the deep dive.');
 			await this.plugin.store.setDeepDive(node, md);
@@ -926,15 +929,18 @@ export class ConceptTreeView extends ItemView {
 
 	/** Keep the "due" chip in sync with the review store. */
 	private async refreshDueCount(): Promise<void> {
-		if (!this.model) {
+		const root = this.model?.root;
+		if (!root) {
 			this.dueCount = 0;
 			this.updateStats();
 			return;
 		}
 		try {
-			const data = await this.plugin.store.loadReview(this.model.root);
+			const data = await this.plugin.store.loadReview(root);
+			if (this.model?.root !== root) return; // another tree was opened meanwhile
 			this.dueCount = reviewStats(data, Date.now()).due;
 		} catch {
+			if (this.model?.root !== root) return;
 			this.dueCount = 0;
 		}
 		this.updateStats();
@@ -963,6 +969,15 @@ export class ConceptTreeView extends ItemView {
 	}
 
 	private async runVaultTree(choice: VaultTreeChoice, graph: GraphNote[]): Promise<void> {
+		// Growing into an existing tree folder would silently mix two trees
+		// (and shadow duplicate concept names) — check before spending a call.
+		if (await this.plugin.store.treeExists(choice.concept)) {
+			new Notice(
+				`A tree named "${choice.concept}" already exists — pick another name.`,
+				8000
+			);
+			return;
+		}
 		if (!this.beginAction()) return;
 		const label = choice.seedKind === 'tag' ? `#${choice.seed}` : `"${choice.seed}"`;
 		this.setBusy(true, `Reading your vault around ${label}…`);
@@ -989,7 +1004,8 @@ export class ConceptTreeView extends ItemView {
 				result,
 				this.plugin.settings.treeFolder,
 				sourceMap(candidates),
-				choice.seedKind === 'note' ? choice.seedPath : undefined
+				choice.seedKind === 'note' ? choice.seedPath : undefined,
+				choice.concept
 			);
 			await this.refreshTrees();
 			await this.openTree(root);

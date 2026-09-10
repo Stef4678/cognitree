@@ -365,12 +365,20 @@ export class AskModal extends Modal {
 	private async ask(questionRaw: string): Promise<void> {
 		const question = questionRaw.trim();
 		if (!question || this.busy) return;
-		await this.seedSystem();
+		// Claim the session before the (async) grounding lookup, so a second
+		// Enter press cannot start a parallel request.
+		this.setBusyUi(true);
+		this.hideAdopt();
+		try {
+			await this.seedSystem();
+		} catch (err) {
+			this.setBusyUi(false);
+			new Notice(`Ask failed: ${(err as Error).message}`, 8000);
+			return;
+		}
 
 		this.pushUserBubble(question);
 		this.messages.push({ role: 'user', content: question });
-		this.hideAdopt();
-		this.setBusyUi(true);
 
 		// The request is buffered by Obsidian requestUrl, so nothing paints
 		// until the model finishes — a live seconds counter keeps the wait
