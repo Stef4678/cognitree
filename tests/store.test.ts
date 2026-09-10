@@ -650,6 +650,21 @@ async function main(): Promise<void> {
 			1,
 			'closeExtraPanels keeps exactly one panel'
 		);
+
+		// The panel the user is looking at is the one that survives, not merely
+		// the first in the tab order.
+		const inUse = makeLeaf();
+		inUse.type = VIEW_TYPE;
+		const redundant = makeLeaf();
+		redundant.type = VIEW_TYPE;
+		leaves.length = 0;
+		leaves.push(redundant, inUse);
+		app.workspace.activeLeaf = inUse;
+		eq(plugin.closeExtraPanels(), 1, 'closeExtraPanels closes one of a restored pair');
+		assert(
+			redundant.detached === true && inUse.detached !== true,
+			'the panel in use survives the cleanup'
+		);
 	}
 
 	// ---------------------------------------------------------------- cycle safety

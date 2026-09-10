@@ -169,6 +169,17 @@ export default class CogniTreePlugin extends Plugin {
 		// early is the other way this view ends up open twice (Obsidian restores
 		// the sidebar tab itself, then this code added a second one).
 		this.app.workspace.onLayoutReady(() => {
+			// A layout saved by an older version can hold more than one CogniTree
+			// tab (a race used to add a second one), and Obsidian restores all of
+			// them on every start — which is what "two identical icons in the
+			// sidebar" was. Every panel shows the same tree, so keep one and close
+			// the rest rather than making the user clean up by hand.
+			const closed = this.closeExtraPanels();
+			if (closed > 0) {
+				console.warn(
+					`CogniTree: closed ${closed} duplicate panel(s) restored from the workspace layout.`
+				);
+			}
 			if (!this.data.lastTree) return;
 			window.setTimeout(() => {
 				if (this.app.workspace.getLeavesOfType(VIEW_TYPE).length === 0) {
@@ -292,14 +303,24 @@ export default class CogniTreePlugin extends Plugin {
 	}
 
 	/**
-	 * Detach every CogniTree panel except the first and return how many were
-	 * closed. Useful when an older version already saved duplicate tabs into the
-	 * workspace layout — Obsidian will keep restoring those until they are closed.
+	 * Detach every CogniTree panel except one and return how many were closed.
+	 * A layout saved by an older version can hold duplicates (a race used to add
+	 * a second tab) and Obsidian keeps restoring them until they are closed; all
+	 * panels show the same tree, so one is always enough. The panel the user is
+	 * looking at is the one kept.
 	 */
 	closeExtraPanels(): number {
 		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
-		for (const leaf of leaves.slice(1)) leaf.detach();
-		return Math.max(0, leaves.length - 1);
+		if (leaves.length < 2) return 0;
+		const active = this.app.workspace.activeLeaf;
+		const keep = active && leaves.includes(active) ? active : leaves[0];
+		let closed = 0;
+		for (const leaf of leaves) {
+			if (leaf === keep) continue;
+			leaf.detach();
+			closed++;
+		}
+		return closed;
 	}
 
 	async openSettings(): Promise<void> {
