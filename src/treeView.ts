@@ -2487,7 +2487,8 @@ class ExportModal extends Modal {
 		const writeVaultFile = async (path: string, content: string) => {
 			const existing = this.plugin.app.vault.getAbstractFileByPath(path);
 			if (existing instanceof TFile) {
-				await this.plugin.app.vault.modify(existing, content);
+				// `process`, not `modify`, so an edit made meanwhile is preserved.
+				await this.plugin.app.vault.process(existing, () => content);
 			} else {
 				await this.plugin.app.vault.create(path, content);
 			}

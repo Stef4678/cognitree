@@ -254,7 +254,9 @@ export class ConceptStore {
 		else if (deepDive === '') node.deepened = 0; // region gone (hand-deleted): drop a stale flag
 		const content = this.noteContent(node, deepDive ?? null);
 		if (existing instanceof TFile) {
-			await this.app.vault.modify(existing, content);
+			// `process` rather than `modify`: it takes the current contents as its
+			// starting point, so a save the user makes while we write is not lost.
+			await this.app.vault.process(existing, () => content);
 		} else {
 			await this.ensureTreeFolder(node);
 			await this.app.vault.create(file, content);

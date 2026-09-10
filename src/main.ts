@@ -140,7 +140,8 @@ export default class CogniTreePlugin extends Plugin {
 		});
 		this.addCommand({
 			id: 'close-extra-panels',
-			name: 'Close extra CogniTree panels',
+			// The UI already shows "CogniTree:" before the command name.
+			name: 'Close extra panels',
 			// Only offered when there is actually something to clean up.
 			checkCallback: (checking) => {
 				if (this.app.workspace.getLeavesOfType(VIEW_TYPE).length < 2) return false;

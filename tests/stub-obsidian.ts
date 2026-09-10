@@ -94,6 +94,13 @@ export class FakeVault {
 		this.files.set(f.path, content);
 	};
 
+	/** Atomic read-modify-write, as Obsidian's Vault.process is. */
+	process = async (f: TFile, fn: (data: string) => string): Promise<string> => {
+		const next = fn(this.files.get(f.path) ?? '');
+		this.files.set(f.path, next);
+		return next;
+	};
+
 	cachedRead = async (f: TFile): Promise<string> => this.files.get(f.path) ?? '';
 
 	getAbstractFileByPath = (p: string): TFile | TFolder | null => {
