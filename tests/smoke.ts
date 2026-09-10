@@ -956,20 +956,58 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 			]),
 		};
 		const crowdedLayout = radialLayout(crowded);
-		// 40 siblings leave ~19px of arc each: a radial label would be taller than
-		// the arc at the inner edge, so the honest answer is no label at all.
+		// 40 siblings leave ~19px of arc each. Nothing fits at full size, so the
+		// font shrinks to the floor — where the shorter names fit outright and the
+		// longer ones are only just cut.
 		eq(
 			crowdedLayout.labels.length,
-			0,
-			'radialLayout: a 40-way ring drops labels instead of overlapping them'
+			many.length,
+			'radialLayout: a 40-way ring still labels every arc'
+		);
+		assert(
+			crowdedLayout.labels.every((label) => label.fontSize < 10.5),
+			'radialLayout: the font shrank to make room before cutting the name'
+		);
+		assert(
+			crowdedLayout.labels.some((label) => label.shortened) &&
+				crowdedLayout.labels.some((label) => !label.shortened),
+			'radialLayout: reduced text keeps the shorter names complete'
 		);
 		eq(
 			crowdedLayout.unlabelled.length,
-			many.length,
-			'radialLayout: those arcs are reported as unlabelled'
+			0,
+			'radialLayout: no arc in the crowded ring is left unlabelled'
 		);
 		eq(countOverlaps(crowdedLayout), 0, 'radialLayout: crowded rings still do not overlap');
 		assertSvgSane('sunburst (crowded ring)', buildRadialSvg(crowded), crowded.nodes.size);
+
+		// A 20-way ring cannot hold these names at full size, but it can at a
+		// smaller size — shrinking must be preferred over ellipsising.
+		const narrower = Array.from({ length: 20 }, (_, i) => `Conservation of Energy ${i + 1}`);
+		const reducedModel: TreeModel = {
+			root: 'Energy',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Energy', node('Energy', null, narrower)],
+				...narrower.map((name) => [name, node(name, 'Energy')] as [string, TreeNode]),
+			]),
+		};
+		const reducedLayout = radialLayout(reducedModel);
+		eq(reducedLayout.labels.length, narrower.length, 'radialLayout: every 20-way arc is labelled');
+		assert(
+			reducedLayout.labels.every(
+				(label) =>
+					label.lines.join(' ').replace(/\s+/g, '') === label.name.replace(/\s+/g, '')
+			),
+			'radialLayout: smaller text keeps those names complete'
+		);
+		assert(
+			reducedLayout.labels.some((label) => label.fontSize < 10.5),
+			'radialLayout: the font was reduced to fit them'
+		);
+		eq(countOverlaps(reducedLayout), 0, 'radialLayout: the reduced text does not overlap');
+		assertSvgSane('sunburst (reduced font)', buildRadialSvg(reducedModel), reducedModel.nodes.size);
 
 		// The root label lives in the disc, so a long root name must be shortened too.
 		const longRoot: TreeModel = {

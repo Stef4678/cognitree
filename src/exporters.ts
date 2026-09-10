@@ -148,6 +148,12 @@ export interface RadialOptions {
 	gap?: number;
 	/** Font size of the ring labels; also drives the width estimate. */
 	labelFontSize?: number;
+	/**
+	 * Smallest font a label may shrink to before its name is ellipsised instead.
+	 * Shrinking beats cutting: a full name at a smaller size reads better than
+	 * "Conser…" at the normal size.
+	 */
+	minLabelFontSize?: number;
 }
 
 /** Rough advance width per character for the label font stack (deliberately generous). */
@@ -228,10 +234,14 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 	const maxLabelChars = Math.max(8, options.maxLabelChars ?? 64);
 	const maxLabelLines = Math.max(1, options.maxLabelLines ?? 3);
 	const gap = Math.max(0, options.gap ?? 0.008);
-	const fontSize = Math.max(6, options.labelFontSize ?? 10.5);
-	const lineHeight = fontSize * 1.25;
-	const charWidth = fontSize * CHAR_WIDTH_EM;
+	const baseFontSize = Math.max(6, options.labelFontSize ?? 10.5);
+	const minFontSize = Math.max(5, Math.min(baseFontSize, options.minLabelFontSize ?? 7.5));
 	const ringThickness = ringWidth - 4;
+	/** Font sizes to try, largest first (whole-pixel steps down to the floor). */
+	const fontSizes: number[] = [];
+	for (let size = baseFontSize; size >= minFontSize - 0.01; size -= 1) {
+		fontSizes.push(Number(size.toFixed(2)));
+	}
 
 	const outer = centerRadius + maxDepth * ringWidth + 26;
 	const size = Math.round(outer * 2 + 40);
@@ -281,28 +291,22 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 		hardBreak: boolean;
 		/** Arc length available where the text sits (binding edge). */
 		arcLength: number;
+		fontSize: number;
+		lineHeight: number;
 	}
-	/**
-	 * Fit a name into an arc. A clean word wrap is preferred in either
-	 * orientation (tangential first, since it reads along the arc), then a wrap
-	 * that has to split a word, and only then an ellipsised label.
-	 *
-	 * A radial label's lines stack *along* the arc, and the arc is narrowest at
-	 * its inner edge, so that edge is the binding constraint for both the number
-	 * of lines and the reported arc length.
-	 */
-	const fit = (
-		name: string,
-		span: number,
-		innerRadius: number,
-		midRadius: number
-	): Fitted | null => {
-		const capped = name.length > maxLabelChars ? `${name.slice(0, maxLabelChars - 1)}…` : name;
-		const orientations = [
+
+	/** Layout options for one font size at one arc. */
+	const shapesAt = (span: number, innerRadius: number, midRadius: number, fontSize: number) => {
+		const charWidth = fontSize * CHAR_WIDTH_EM;
+		const lineHeight = fontSize * 1.25;
+		return [
 			{
 				orientation: 'tangential' as const,
 				perLine: Math.floor((span * midRadius - 6) / charWidth),
-				maxLines: Math.max(1, Math.min(maxLabelLines, Math.floor((ringThickness - 8) / lineHeight))),
+				maxLines: Math.max(
+					1,
+					Math.min(maxLabelLines, Math.floor((ringThickness - 8) / lineHeight))
+				),
 				arcLength: span * midRadius,
 			},
 			{
@@ -315,41 +319,66 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 				arcLength: span * innerRadius,
 			},
 		];
+	};
 
-		for (const allowHardBreak of [false, true]) {
-			for (const candidate of orientations) {
-				if (candidate.perLine < 4 || candidate.maxLines < 1) continue;
-				const wrapped = wrap(capped, candidate.perLine, candidate.maxLines);
-				if (!wrapped) continue;
-				if (wrapped.hardBreak && !allowHardBreak) continue;
-				return {
-					lines: wrapped.lines,
-					orientation: candidate.orientation,
-					shortened: capped !== name,
-					hardBreak: wrapped.hardBreak,
-					arcLength: candidate.arcLength,
-				};
+	/**
+	 * Fit a name into an arc:
+	 *  1. the whole name at the largest font that can hold it (so text shrinks
+	 *     before it is cut), preferring a clean word wrap over splitting a word,
+	 *     and tangential over radial;
+	 *  2. failing that, as much of the name as the smallest font can show,
+	 *     ellipsised;
+	 *  3. failing that, no label (the arc still shows the node's size and colour).
+	 */
+	const fit = (name: string, span: number, innerRadius: number, midRadius: number): Fitted | null => {
+		const capped = name.length > maxLabelChars ? `${name.slice(0, maxLabelChars - 1)}…` : name;
+		const shortened = capped !== name;
+
+		for (const fontSize of fontSizes) {
+			const lineHeight = fontSize * 1.25;
+			const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
+			for (const allowHardBreak of [false, true]) {
+				for (const shape of shapes) {
+					if (shape.perLine < 4 || shape.maxLines < 1) continue;
+					const wrapped = wrap(capped, shape.perLine, shape.maxLines);
+					if (!wrapped) continue;
+					if (wrapped.hardBreak && !allowHardBreak) continue;
+					return {
+						lines: wrapped.lines,
+						orientation: shape.orientation,
+						shortened,
+						hardBreak: wrapped.hardBreak,
+						arcLength: shape.arcLength,
+						fontSize,
+						lineHeight,
+					};
+				}
 			}
 		}
 
-		// Nothing fits: shorten where there is the most room.
-		const [tangential, radial] = orientations;
-		const useRadial =
-			radial.perLine * radial.maxLines > tangential.perLine * tangential.maxLines;
-		const chosen = useRadial ? radial : tangential;
-		const capacity = chosen.perLine * chosen.maxLines;
-		if (chosen.perLine < 4 || capacity < 6) return null;
-		const clipped = `${name.slice(0, capacity - 1)}…`;
-		const wrapped = wrap(clipped, chosen.perLine, chosen.maxLines);
-		return wrapped
-			? {
-					lines: wrapped.lines,
-					orientation: chosen.orientation,
-					shortened: true,
-					hardBreak: wrapped.hardBreak,
-					arcLength: chosen.arcLength,
-			  }
-			: null;
+		// Too small for the whole name even at the floor size: show as much as
+		// possible from the size with the most room.
+		for (const fontSize of [...fontSizes].reverse()) {
+			const lineHeight = fontSize * 1.25;
+			const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
+			const best = shapes
+				.slice()
+				.sort((a, b) => b.perLine * b.maxLines - a.perLine * a.maxLines)[0];
+			const capacity = best.perLine * best.maxLines;
+			if (best.perLine < 4 || capacity < 6) continue;
+			const wrapped = wrap(`${name.slice(0, capacity - 1)}…`, best.perLine, best.maxLines);
+			if (!wrapped) continue;
+			return {
+				lines: wrapped.lines,
+				orientation: best.orientation,
+				shortened: true,
+				hardBreak: wrapped.hardBreak,
+				arcLength: best.arcLength,
+				fontSize,
+				lineHeight,
+			};
+		}
+		return null;
 	};
 
 	const arcs: RadialArc[] = [];
@@ -397,8 +426,8 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 				// where the arc is narrowest.
 				const tangentialExtent =
 					fitted.orientation === 'radial'
-						? fitted.lines.length * lineHeight
-						: longest * charWidth;
+						? fitted.lines.length * fitted.lineHeight
+						: longest * fitted.fontSize * CHAR_WIDTH_EM;
 				const footprintRadius = fitted.orientation === 'radial' ? inner + 6 : radius;
 				labels.push({
 					name,
@@ -411,8 +440,8 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 					y: py,
 					rotation: flipped ? degrees + 180 : degrees,
 					anchor: fitted.orientation === 'radial' ? (flipped ? 'end' : 'start') : 'middle',
-					fontSize,
-					lineHeight,
+					fontSize: fitted.fontSize,
+					lineHeight: fitted.lineHeight,
 					halfAngle: tangentialExtent / 2 / footprintRadius,
 					arcLength: fitted.arcLength,
 					shortened: fitted.shortened,
