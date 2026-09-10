@@ -642,6 +642,7 @@ import {
 import {
 	buildGraph,
 	neighborhood,
+	noteTags,
 	notesWithTag,
 	sourceMap,
 	toCandidates,
@@ -705,6 +706,30 @@ import {
 		candidates.length === 4 && candidates[3].name === 'Delta' && candidates[3].backlinks === 0,
 		'toCandidates: name + tags + backlinks'
 	);
+}
+
+// --- note tags (metadataCache normalisation) ------------------------------
+{
+	// Minimal CacheMetadata stand-ins: only what noteTags reads.
+	const cache = (frontmatter: unknown, tags?: { tag: string }[]) =>
+		({ frontmatter, tags: tags ?? [] }) as never;
+
+	assert(noteTags(null).length === 0 && noteTags(undefined).length === 0, 'noteTags: no cache → no tags');
+	assert(
+		JSON.stringify(noteTags(cache({ tags: 'research' }))) === JSON.stringify(['#research']),
+		'noteTags: a bare string stays one tag (not one per character)'
+	);
+	assert(
+		JSON.stringify(
+			noteTags(cache({ tags: ['#a', 'b'] }, [{ tag: '#c' }, { tag: 'c' }]))
+		) === JSON.stringify(['#a', '#b', '#c']),
+		'noteTags: lists, inline tags, missing # and duplicates are normalised'
+	);
+	assert(
+		JSON.stringify(noteTags(cache({ tags: 7 }))) === JSON.stringify(['#7']),
+		'noteTags: a numeric tag becomes a string'
+	);
+	assert(noteTags(cache({}, [])).length === 0, 'noteTags: no tags → empty list');
 }
 
 // --- report --------------------------------------------------------------

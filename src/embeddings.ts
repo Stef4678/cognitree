@@ -1,5 +1,6 @@
 import type { App } from 'obsidian';
 import type { PluginSettings } from './types';
+import { noteTags } from './vaultGraph';
 
 /**
  * Semantic index: embeddings of the user's vault notes, used to rank
@@ -85,7 +86,7 @@ export function rankBySimilarity(
 export function vectorText(name: string, tags: string[], body: string, maxChars = 400): string {
 	const clean = body
 		.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n?/, '')
-		.replace(/[#>*_`\[\]()]/g, ' ')
+		.replace(/[#>*_`[\]()]/g, ' ')
 		.replace(/\s+/g, ' ')
 		.trim()
 		.slice(0, maxChars);
@@ -238,11 +239,9 @@ export class SemanticIndex {
 			try {
 				const texts = await Promise.all(
 					chunk.map(async (file) => {
-						const cache = this.app.metadataCache.getFileCache(file);
-						const tags = [
-							...(cache?.frontmatter?.tags ?? []),
-							...(cache?.tags?.map((t) => t.tag) ?? []),
-						].map(String);
+						// Shared with the vault graph so tag handling (string vs list
+						// frontmatter, leading '#') can only be right in one place.
+						const tags = noteTags(this.app.metadataCache.getFileCache(file));
 						const body = await this.app.vault.cachedRead(file);
 						return vectorText(file.basename, tags, body);
 					})

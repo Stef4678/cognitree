@@ -1,4 +1,4 @@
-import type { App } from 'obsidian';
+import type { App, CachedMetadata } from 'obsidian';
 import { normalizeKey } from './parser';
 import type { VaultTreeCandidate } from './prompts';
 
@@ -136,6 +136,28 @@ export function sourceMap(notes: GraphNote[]): Map<string, string> {
 }
 
 /**
+ * Tags of a note from its metadata cache, normalised to `#tag` strings.
+ *
+ * `frontmatter.tags` is legitimate YAML as a list, a single string or a number,
+ * and the frontmatter is typed `any`, so it is narrowed to `unknown` first:
+ * spreading a bare string would otherwise produce one tag per character, and
+ * spreading `any` would leak that type into everything downstream.
+ */
+export function noteTags(cache: CachedMetadata | null | undefined): string[] {
+	const raw: unknown = cache?.frontmatter?.tags;
+	const frontmatterTags: unknown[] = Array.isArray(raw) ? raw : raw ? [raw] : [];
+	const inlineTags: string[] = (cache?.tags ?? []).map((t) => t.tag);
+	return [
+		...new Set(
+			[...frontmatterTags, ...inlineTags]
+				.map((t) => String(t).trim())
+				.filter(Boolean)
+				.map((t) => (t.startsWith('#') ? t : `#${t}`))
+		),
+	];
+}
+
+/**
  * Read the vault's note graph from `metadataCache` (names, tags, resolved
  * links). The tree folder is excluded so generated notes never feed back in.
  */
@@ -146,24 +168,10 @@ export function collectVaultNotes(app: App, opts: { excludeFolder: string }): Gr
 	for (const file of app.vault.getMarkdownFiles()) {
 		if (excluded && (file.path === excluded || file.path.startsWith(excluded + '/'))) continue;
 		const cache = app.metadataCache.getFileCache(file);
-		// `frontmatter.tags` is legitimate YAML: a list, a single string or a
-		// number. Spreading a bare string would turn it into one tag per
-		// character, so normalise it first.
-		const rawTags = cache?.frontmatter?.tags;
-		const frontmatterTags = Array.isArray(rawTags) ? rawTags : rawTags ? [rawTags] : [];
-		const inlineTags = (cache?.tags ?? []).map((t) => t.tag);
-		const tags = [
-			...new Set(
-				[...frontmatterTags, ...inlineTags]
-					.map((t) => String(t).trim())
-					.filter(Boolean)
-					.map((t) => (t.startsWith('#') ? t : `#${t}`))
-			),
-		];
 		raw.push({
 			name: file.basename,
 			path: file.path,
-			tags,
+			tags: noteTags(cache),
 			links: Object.keys(resolved[file.path] ?? {}),
 		});
 	}

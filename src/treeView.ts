@@ -1888,7 +1888,9 @@ class VaultTreeModal extends Modal {
 				'A note grows a tree around its link neighbourhood; a tag grows one over the notes carrying it.'
 			)
 			.addDropdown((dd) => {
-				sources.forEach((source, i) => dd.addOption(String(i), source.label));
+				sources.forEach((source, i) => {
+					dd.addOption(String(i), source.label);
+				});
 				dd.setValue('0');
 				dd.onChange((value) => {
 					this.choice = sources[Number(value)] ?? sources[0];
