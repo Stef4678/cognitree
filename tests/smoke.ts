@@ -1,6 +1,7 @@
 /**
  * Smoke tests for pure logic (no Obsidian runtime). Run via:
- *   node esbuild.config.mjs test  (see below) — or build+run manually.
+ *   npm test
+ * which bundles this suite (and tests/store.test.ts) and runs both with node.
  */
 import {
 	extractJSON,
@@ -106,6 +107,26 @@ by an object due to its motion.",
 
 	// Primitive garbage must NOT be treated as a valid object result.
 	assert(extractJSON('just some text, no braces') === null, 'repair: plain prose stays null');
+
+	// A brace in trailing prose must not swallow the payload (balanced-brace scan).
+	const proseBrace = extractJSON<{ a: number }>('Here you go: {"a": 1} — see {x} for context.');
+	assert(proseBrace?.a === 1, 'extractJSON: braces in trailing prose');
+	assert(
+		extractJSON<{ a: number }>('{"a": 1} and then a stray "}" in prose')?.a === 1,
+		'extractJSON: quoted stray brace in prose'
+	);
+
+	// A schema skeleton echoed before the real payload must not win.
+	const echoed = extractJSON<{ concept: string; domains: unknown[] }>(
+		'Format: {"concept": "name", "domains": []}\nHere is mine: {"concept": "energy", "domains": [{"name": "Physics"}]}'
+	);
+	assert(
+		echoed?.concept === 'energy' && echoed?.domains?.length === 1,
+		'extractJSON: largest object wins over a schema echo'
+	);
+
+	// The prompts demand an object; an array is never a valid result.
+	assert(extractJSON('[1, 2, 3]') === null, 'extractJSON: bare array stays null');
 }
 
 // --- repairMissingBraces --------------------------------------------------
@@ -178,12 +199,15 @@ by an object due to its motion.",
 // --- helpers -------------------------------------------------------------
 {
 	assert(slugify('Direct Democracy') === 'direct_democracy', 'slugify');
+	assert(slugify('任意 概念') === '任意_概念', 'slugify keeps non-Latin letters');
 	assert(sanitizeFileName('A:B/C?D*') === 'A B C D', 'sanitizeFileName');
 	assert(sanitizeFileName('...') === 'concept', 'sanitizeFileName empty fallback');
 	assert(normalizeKey('  Democracy ') === 'democracy', 'normalizeKey');
 	assert(hashString('x') === hashString('x') && hashString('x') !== hashString('y'), 'hashString stable');
 	assert(toInt('2025-01-01T00:00:00.000Z', 0) > 1_700_000_000_000, 'toInt parses ISO timestamps');
 	assert(toInt('3', 0) === 3, 'toInt parses numbers');
+	assert(toInt('0', 5) === 0, 'toInt keeps an explicit zero');
+	assert(toInt('garbage', 5) === 5, 'toInt falls back on garbage');
 	assert(toBool('true', false) === true && toBool(0, true) === false, 'toBool');
 	assert(normalizeComplexity('Advanced') === 'Advanced', 'normalizeComplexity');
 	assert(normalizeComplexity('garbage') === 'Intermediate', 'normalizeComplexity fallback');
@@ -304,6 +328,21 @@ import { buildFollowUpSystem } from '../src/prompts';
 	const charCapped = buildBranchDigest(model, 'Direct Democracy', 20, 60);
 	assert(charCapped.text.includes('omitted'), 'digest: char cap → truncation note');
 
+	// The header lines count against the budget too, and one huge description is
+	// clipped instead of dominating the digest.
+	const fat = node('Fat', null, 'x'.repeat(5000));
+	const fatModel: TreeModel = {
+		root: 'Fat',
+		folder: 'f',
+		updatedAt: 0,
+		nodes: new Map([['Fat', fat]]),
+	};
+	const fatDigest = buildBranchDigest(fatModel, 'Fat', 60, 20000);
+	assert(
+		fatDigest.text.length < 1000 && fatDigest.text.includes('…'),
+		'digest: huge description is clipped'
+	);
+
 	const leaf = buildBranchDigest(model, 'Referendums', 20, 20000);
 	assert(
 		leaf.text.includes('nearby siblings') && leaf.text.includes('Citizen Assemblies'),
@@ -339,6 +378,11 @@ import { buildFollowUpSystem } from '../src/prompts';
 	);
 	const boldHead = parseSuggestedChildren('**Suggested children:**\n- A Child: ok');
 	assert(boldHead.length === 1 && boldHead[0]?.name === 'A Child', 'suggested children: bold heading');
+	const blankAfter = parseSuggestedChildren('### Suggested children\n\n- A Child: ok\n- B Child: also');
+	assert(
+		blankAfter.length === 2 && blankAfter[0]?.name === 'A Child',
+		'suggested children: blank line after the heading'
+	);
 	const dupe = parseSuggestedChildren('### Suggested children\n- Swiss Referendums: one\n- Swiss Referendums: two');
 	assert(dupe.length === 1, 'suggested children: duplicates deduped');
 

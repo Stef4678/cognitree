@@ -5,7 +5,9 @@
 	"main": "main.js",
 	"scripts": {
 		"dev": "node esbuild.config.mjs",
-		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+		"test:build": "esbuild tests/smoke.ts --bundle --platform=node --format=cjs --target=es2018 --outfile=tests/.build/smoke.cjs && esbuild tests/store.test.ts --bundle --platform=node --format=cjs --target=es2018 --alias:obsidian=./tests/stub-obsidian.ts --outfile=tests/.build/store.test.cjs",
+		"test": "npm run test:build && node tests/.build/smoke.cjs && node tests/.build/store.test.cjs"
 	},
 	"keywords": [
 		"obsidian",

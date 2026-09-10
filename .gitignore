@@ -3,5 +3,7 @@ node_modules/
 main.js
 main.js.map
 .tmp-smoke.js
+tests/.build/
+.dsh-kanban.json
 .claude/
 *.log
