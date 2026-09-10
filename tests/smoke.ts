@@ -909,13 +909,32 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		eq(layout.labels.length, names.length, 'radialLayout: a shortened label for every arc that fits');
 		let tooWide = 0;
 		for (const label of layout.labels) {
-			if (label.text.length * label.fontSize * 0.58 > label.arcLength + 0.5) tooWide++;
+			const longest = Math.max(...label.lines.map((line) => line.length));
+			const textPx = longest * label.fontSize * 0.58;
+			const blockPx = label.lines.length * label.lineHeight;
+			if (label.orientation === 'tangential') {
+				if (textPx > label.arcLength + 0.5) tooWide++;
+			} else if (textPx > layout.ringWidth - 8 || blockPx > label.arcLength + 0.5) {
+				// A radial label must fit the ring's thickness and its own arc.
+				tooWide++;
+			}
 		}
 		eq(tooWide, 0, 'radialLayout: every label fits inside its own arc');
 		eq(countOverlaps(layout), 0, 'radialLayout: no two labels in a ring overlap');
 		assert(
-			layout.labels.every((label) => label.text.endsWith('…')),
-			'radialLayout: dense labels are shortened, not left overflowing'
+			layout.labels.every(
+				(label) =>
+					label.lines.join(' ').replace(/\s+/g, '') === label.name.replace(/\s+/g, '')
+			),
+			'radialLayout: dense rings still show every name in full (wrapped)'
+		);
+		assert(
+			layout.labels.every((label) => !label.hardBreak),
+			'radialLayout: no word is split — the other orientation is used instead'
+		);
+		assert(
+			layout.labels.some((label) => label.orientation === 'radial' && label.lines.length > 1),
+			'radialLayout: narrow arcs switch to wrapped radial labels'
 		);
 		const denseSvg = buildRadialSvg(dense);
 		assertSvgSane('sunburst (dense ring)', denseSvg, dense.nodes.size);
@@ -937,14 +956,17 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 			]),
 		};
 		const crowdedLayout = radialLayout(crowded);
-		assert(
-			crowdedLayout.unlabelled.length > 0,
-			`radialLayout: drops labels that cannot fit (${crowdedLayout.unlabelled.length} of ${many.length})`
+		// 40 siblings leave ~19px of arc each: a radial label would be taller than
+		// the arc at the inner edge, so the honest answer is no label at all.
+		eq(
+			crowdedLayout.labels.length,
+			0,
+			'radialLayout: a 40-way ring drops labels instead of overlapping them'
 		);
 		eq(
-			crowdedLayout.labels.length + crowdedLayout.unlabelled.length,
+			crowdedLayout.unlabelled.length,
 			many.length,
-			'radialLayout: every arc is either labelled or reported as too small'
+			'radialLayout: those arcs are reported as unlabelled'
 		);
 		eq(countOverlaps(crowdedLayout), 0, 'radialLayout: crowded rings still do not overlap');
 		assertSvgSane('sunburst (crowded ring)', buildRadialSvg(crowded), crowded.nodes.size);
@@ -960,11 +982,27 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 			]),
 		};
 		const rootLayout = radialLayout(longRoot);
-		assert(
-			rootLayout.rootText !== null && rootLayout.rootText.endsWith('…'),
-			`radialLayout: a long root name is shortened for the disc (${rootLayout.rootText})`
+		eq(
+			rootLayout.rootLines.join(' '),
+			'Thermodynamics in Chemistry',
+			'radialLayout: a long root name wraps to fit the disc instead of being cut'
 		);
 		assertSvgSane('sunburst (long root)', buildRadialSvg(longRoot), longRoot.nodes.size);
+
+		// A realistically long concept name must be readable in full.
+		const mediumName = 'Thermodynamics in Chemistry';
+		const medium: TreeModel = {
+			root: 'Energy',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Energy', node('Energy', null, [mediumName])],
+				[mediumName, node(mediumName, 'Energy')],
+			]),
+		};
+		const mediumSvg = buildRadialSvg(medium);
+		assert(mediumSvg.includes(mediumName), 'sunburst: a long name is drawn in full when it fits');
+		assert(!mediumSvg.includes('…'), 'sunburst: nothing is ellipsised when the arc has room');
 	}
 
 	// Edge cases: a lone root, a deep chain, and a frontmatter cycle.
@@ -1007,13 +1045,38 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 	const longSvg = buildRadialSvg(longModel);
 	assertSvgSane('sunburst (long name)', longSvg, 2);
 	assert(
-		!longSvg.includes(`>${longName}<`),
-		'sunburst: long labels are not emitted as text in full'
+		longSvg.includes(longName),
+		'sunburst: a 63-character name is drawn in full when its arc has room'
 	);
-	assert(longSvg.includes('…'), 'sunburst: truncated labels are marked with an ellipsis');
+	assert(!longSvg.includes('…'), 'sunburst: nothing is ellipsised while the name fits');
 	assert(
 		longSvg.includes(`data-node="${longName}"`),
-		'sunburst: the full name is still kept in the data-node attribute'
+		'sunburst: the full name is kept in the data-node attribute'
+	);
+
+	// Past maxLabelChars even a roomy arc ellipsises, so one label cannot become
+	// a wall of text.
+	const cappedName =
+		'A concept name long enough to exceed the sixty-four character label cap used by the exporter';
+	assert(cappedName.length > 64, 'test fixture: the capped name is longer than the cap');
+	const cappedModel: TreeModel = {
+		root: 'Root',
+		folder: 'f',
+		updatedAt: 0,
+		nodes: new Map<string, TreeNode>([
+			['Root', node('Root', null, [cappedName])],
+			[cappedName, node(cappedName, 'Root')],
+		]),
+	};
+	const cappedSvg = buildRadialSvg(cappedModel);
+	assert(cappedSvg.includes('…'), 'sunburst: beyond the character cap the label is ellipsised');
+	assert(
+		!cappedSvg.includes(`>${cappedName}<`),
+		'sunburst: the over-long name is not emitted as text in full'
+	);
+	assert(
+		cappedSvg.includes(`data-node="${cappedName}"`),
+		'sunburst: the over-long name is still kept in the data-node attribute'
 	);
 }
 

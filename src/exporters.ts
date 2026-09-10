@@ -140,8 +140,10 @@ export interface RadialOptions {
 	centerRadius?: number;
 	/** Thickness of one depth ring. */
 	ringWidth?: number;
-	/** Labels longer than this are ellipsised. */
-	maxLabelLength?: number;
+	/** Absolute cap on a label's characters, however much room it has. */
+	maxLabelChars?: number;
+	/** Maximum number of lines one label may wrap to. */
+	maxLabelLines?: number;
 	/** Angular padding between sibling arcs, in radians. */
 	gap?: number;
 	/** Font size of the ring labels; also drives the width estimate. */
@@ -165,19 +167,35 @@ export interface RadialArc {
 
 export interface RadialLabel {
 	name: string;
-	/** The (possibly ellipsised) text actually drawn. */
+	/** The wrapped lines actually drawn (never empty). */
+	lines: string[];
+	/** The lines joined by a space, for tests and debugging. */
 	text: string;
+	/**
+	 * `tangential` runs along the arc (nicer); `radial` runs outward from the
+	 * centre, which has far more room when the arc is narrow.
+	 */
+	orientation: 'tangential' | 'radial';
 	/** Angle of the arc's middle. */
 	angle: number;
-	/** Radius the text is centred on. */
+	/** Radius the text is centred on (tangential) or anchored at (radial). */
 	radius: number;
+	/** Anchor point, orientation-aware. */
+	x: number;
+	y: number;
 	/** Rotation in degrees, already flipped so it is never upside down. */
 	rotation: number;
+	anchor: 'start' | 'middle' | 'end';
 	fontSize: number;
-	/** Angular half-width this text needs at `radius`. */
+	lineHeight: number;
+	/** Angular half-width the text block occupies at its radius. */
 	halfAngle: number;
 	/** Arc length available inside the node's own arc, in px. */
 	arcLength: number;
+	/** True when the name had to be ellipsised to fit. */
+	shortened: boolean;
+	/** True when a single word was longer than a line and had to be split. */
+	hardBreak: boolean;
 }
 
 export interface RadialLayout {
@@ -188,8 +206,9 @@ export interface RadialLayout {
 	ringWidth: number;
 	arcs: RadialArc[];
 	labels: RadialLabel[];
-	/** Root disc label (null when even a short name cannot fit). */
-	rootText: string | null;
+	/** Root disc label, wrapped to fit the disc (empty when nothing fits). */
+	rootLines: string[];
+	rootLineHeight: number;
 	/** Nodes left unlabelled because their arc could not hold readable text. */
 	unlabelled: string[];
 }
@@ -198,34 +217,139 @@ export interface RadialLayout {
  * Geometry for the radial sunburst: depth is the radius and the angular width of
  * a node is proportional to the number of concepts in its subtree.
  *
- * Kept separate from the SVG rendering so the invariant that matters — a label
- * never spills over its neighbours — can be asserted directly in tests. Labels
- * are drawn tangentially at a fixed radius, so a label is only emitted when the
- * text actually fits inside its own arc; otherwise it is shortened, and dropped
- * entirely when not even a few characters fit.
+ * Kept separate from the SVG rendering so the invariants that matter — a label
+ * never spills over its neighbours, and a name is shown in full whenever its arc
+ * has room for it — can be asserted directly in tests.
  */
 export function radialLayout(model: TreeModel, options: RadialOptions = {}): RadialLayout {
 	const { depth, weight, branch, maxDepth } = analyseTree(model);
 	const centerRadius = Math.max(24, options.centerRadius ?? 74);
 	const ringWidth = Math.max(20, options.ringWidth ?? 104);
-	const maxLabelLength = Math.max(6, options.maxLabelLength ?? 22);
+	const maxLabelChars = Math.max(8, options.maxLabelChars ?? 64);
+	const maxLabelLines = Math.max(1, options.maxLabelLines ?? 3);
 	const gap = Math.max(0, options.gap ?? 0.008);
 	const fontSize = Math.max(6, options.labelFontSize ?? 10.5);
+	const lineHeight = fontSize * 1.25;
+	const charWidth = fontSize * CHAR_WIDTH_EM;
+	const ringThickness = ringWidth - 4;
 
 	const outer = centerRadius + maxDepth * ringWidth + 26;
 	const size = Math.round(outer * 2 + 40);
 	const cx = size / 2;
 	const cy = size / 2 + 10;
 
-	const textWidth = (text: string, size2: number): number => text.length * size2 * CHAR_WIDTH_EM;
-	/** Fit `name` into `available` px, or null when nothing readable fits. */
-	const fit = (name: string, available: number, size2: number): string | null => {
-		if (available < 20) return null;
-		const maxChars = Math.floor(available / (size2 * CHAR_WIDTH_EM));
-		if (maxChars < 4) return null;
-		const capped = name.length > maxLabelLength ? `${name.slice(0, maxLabelLength - 1)}…` : name;
-		if (capped.length <= maxChars) return capped;
-		return `${name.slice(0, maxChars - 1)}…`;
+	/** Greedy word wrap; `hardBreak` is set when a word had to be split. */
+	const wrap = (
+		text: string,
+		perLine: number,
+		maxLines: number
+	): { lines: string[]; hardBreak: boolean } | null => {
+		if (perLine < 3) return null;
+		const words = text.split(/\s+/).filter(Boolean);
+		const lines: string[] = [];
+		let hardBreak = false;
+		let current = '';
+		const push = (line: string): boolean => {
+			if (lines.length >= maxLines) return false;
+			lines.push(line);
+			return true;
+		};
+		for (const word of words) {
+			const candidate = current ? `${current} ${word}` : word;
+			if (candidate.length <= perLine) {
+				current = candidate;
+				continue;
+			}
+			if (current && !push(current)) return null;
+			current = '';
+			let rest = word;
+			while (rest.length > perLine) {
+				if (!push(rest.slice(0, perLine))) return null;
+				rest = rest.slice(perLine);
+				hardBreak = true;
+			}
+			current = rest;
+		}
+		if (current && !push(current)) return null;
+		return lines.length > 0 ? { lines, hardBreak } : null;
+	};
+
+	interface Fitted {
+		lines: string[];
+		orientation: 'tangential' | 'radial';
+		shortened: boolean;
+		hardBreak: boolean;
+		/** Arc length available where the text sits (binding edge). */
+		arcLength: number;
+	}
+	/**
+	 * Fit a name into an arc. A clean word wrap is preferred in either
+	 * orientation (tangential first, since it reads along the arc), then a wrap
+	 * that has to split a word, and only then an ellipsised label.
+	 *
+	 * A radial label's lines stack *along* the arc, and the arc is narrowest at
+	 * its inner edge, so that edge is the binding constraint for both the number
+	 * of lines and the reported arc length.
+	 */
+	const fit = (
+		name: string,
+		span: number,
+		innerRadius: number,
+		midRadius: number
+	): Fitted | null => {
+		const capped = name.length > maxLabelChars ? `${name.slice(0, maxLabelChars - 1)}…` : name;
+		const orientations = [
+			{
+				orientation: 'tangential' as const,
+				perLine: Math.floor((span * midRadius - 6) / charWidth),
+				maxLines: Math.max(1, Math.min(maxLabelLines, Math.floor((ringThickness - 8) / lineHeight))),
+				arcLength: span * midRadius,
+			},
+			{
+				orientation: 'radial' as const,
+				perLine: Math.floor((ringThickness - 12) / charWidth),
+				// Lines stack along the arc, so how many fit depends on the arc at the
+				// inner edge. Zero means a radial label cannot be placed without
+				// spilling over its neighbours, so this orientation is dropped.
+				maxLines: Math.min(maxLabelLines, Math.floor((span * innerRadius) / lineHeight)),
+				arcLength: span * innerRadius,
+			},
+		];
+
+		for (const allowHardBreak of [false, true]) {
+			for (const candidate of orientations) {
+				if (candidate.perLine < 4 || candidate.maxLines < 1) continue;
+				const wrapped = wrap(capped, candidate.perLine, candidate.maxLines);
+				if (!wrapped) continue;
+				if (wrapped.hardBreak && !allowHardBreak) continue;
+				return {
+					lines: wrapped.lines,
+					orientation: candidate.orientation,
+					shortened: capped !== name,
+					hardBreak: wrapped.hardBreak,
+					arcLength: candidate.arcLength,
+				};
+			}
+		}
+
+		// Nothing fits: shorten where there is the most room.
+		const [tangential, radial] = orientations;
+		const useRadial =
+			radial.perLine * radial.maxLines > tangential.perLine * tangential.maxLines;
+		const chosen = useRadial ? radial : tangential;
+		const capacity = chosen.perLine * chosen.maxLines;
+		if (chosen.perLine < 4 || capacity < 6) return null;
+		const clipped = `${name.slice(0, capacity - 1)}…`;
+		const wrapped = wrap(clipped, chosen.perLine, chosen.maxLines);
+		return wrapped
+			? {
+					lines: wrapped.lines,
+					orientation: chosen.orientation,
+					shortened: true,
+					hardBreak: wrapped.hardBreak,
+					arcLength: chosen.arcLength,
+			  }
+			: null;
 	};
 
 	const arcs: RadialArc[] = [];
@@ -255,20 +379,44 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 			arcs.push(arc);
 
 			const angle = (from + to) / 2;
-			const radius = inner + (ringWidth - 4) / 2;
-			const arcLength = Math.max(0, arc.to - arc.from) * radius;
-			const text = fit(node.name, arcLength - 8, fontSize);
-			if (text) {
+			const radius = inner + ringThickness / 2;
+			const span = Math.max(0, arc.to - arc.from);
+			const fitted = fit(node.name, span, inner + 6, radius);
+			if (fitted) {
+				const longest = Math.max(...fitted.lines.map((line) => line.length));
 				const degrees = (angle * 180) / Math.PI;
+				const flipped = degrees > 90 && degrees < 270;
+				const [px, py] =
+					fitted.orientation === 'radial'
+						? flipped
+							? [cx + (outerRadius - 6) * Math.cos(angle), cy + (outerRadius - 6) * Math.sin(angle)]
+							: [cx + (inner + 6) * Math.cos(angle), cy + (inner + 6) * Math.sin(angle)]
+						: [cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)];
+				// Tangential footprint of the block, in px along the arc. For radial
+				// labels that is the stacked height, measured at the inner edge
+				// where the arc is narrowest.
+				const tangentialExtent =
+					fitted.orientation === 'radial'
+						? fitted.lines.length * lineHeight
+						: longest * charWidth;
+				const footprintRadius = fitted.orientation === 'radial' ? inner + 6 : radius;
 				labels.push({
 					name,
-					text,
+					lines: fitted.lines,
+					text: fitted.lines.join(' '),
+					orientation: fitted.orientation,
 					angle,
 					radius,
-					rotation: degrees > 90 && degrees < 270 ? degrees + 180 : degrees,
+					x: px,
+					y: py,
+					rotation: flipped ? degrees + 180 : degrees,
+					anchor: fitted.orientation === 'radial' ? (flipped ? 'end' : 'start') : 'middle',
 					fontSize,
-					halfAngle: textWidth(text, fontSize) / 2 / radius,
-					arcLength,
+					lineHeight,
+					halfAngle: tangentialExtent / 2 / footprintRadius,
+					arcLength: fitted.arcLength,
+					shortened: fitted.shortened,
+					hardBreak: fitted.hardBreak,
 				});
 			} else {
 				unlabelled.push(name);
@@ -297,10 +445,24 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 	}
 
 	const rootName = model.nodes.get(model.root)?.name ?? model.root;
-	// The root label sits in a disc, so it has to fit the chord across it.
-	const rootText = fit(rootName, 2 * (centerRadius - 12), 13);
+	const rootFont = 13;
+	const rootLineHeight = rootFont * 1.25;
+	// The root label sits in a disc, so it wraps to the chord across it.
+	const rootLines =
+		wrap(rootName, Math.floor((2 * (centerRadius - 14)) / (rootFont * CHAR_WIDTH_EM)), 2)?.lines ?? [];
 
-	return { size, cx, cy, centerRadius, ringWidth, arcs, labels, rootText, unlabelled };
+	return {
+		size,
+		cx,
+		cy,
+		centerRadius,
+		ringWidth,
+		arcs,
+		labels,
+		rootLines,
+		rootLineHeight,
+		unlabelled,
+	};
 }
 
 /**
@@ -309,12 +471,15 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
  * This is the layout to reach for when a tree is wide rather than deep — the
  * layered SVG grows with the number of leaves (a 33-node tree can be ~3200px
  * wide for 292px of height), while the sunburst stays roughly square and makes
- * "which branch is biggest" obvious at a glance. Only labels that fit inside
- * their own arc are drawn, so dense rings stay readable.
+ * "which branch is biggest" obvious at a glance.
+ *
+ * Names are shown in full whenever their arc has room: labels wrap onto up to
+ * three lines, and a narrow arc switches to a radial label running outward,
+ * which has the whole ring thickness to work with.
  */
 export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): string {
 	const layout = radialLayout(model, options);
-	const { size, cx, cy, centerRadius, arcs, labels, rootText } = layout;
+	const { size, cx, cy, centerRadius, arcs, labels, rootLines, rootLineHeight } = layout;
 	const round = (value: number): string => value.toFixed(2);
 	const point = (radius: number, angle: number): [number, number] => [
 		cx + radius * Math.cos(angle),
@@ -348,28 +513,38 @@ export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): s
 		.join('\n');
 	const labelMarkup = labels
 		.map((label) => {
-			const [lx, ly] = point(label.radius, label.angle);
-			return `<text x="${round(lx)}" y="${round(ly)}" font-size="${
+			const tspans = label.lines
+				.map((line, i) => {
+					const dy = i === 0 ? -((label.lines.length - 1) * label.lineHeight) / 2 : label.lineHeight;
+					return `<tspan x="${round(label.x)}" dy="${round(dy)}">${escapeXml(line)}</tspan>`;
+				})
+				.join('');
+			return `<text x="${round(label.x)}" y="${round(label.y)}" font-size="${
 				label.fontSize
-			}" fill="#2c2740" text-anchor="middle" transform="rotate(${round(label.rotation)} ${round(
-				lx
-			)} ${round(ly)})">${escapeXml(label.text)}</text>`;
+			}" fill="#2c2740" text-anchor="${label.anchor}" transform="rotate(${round(label.rotation)} ${round(
+				label.x
+			)} ${round(label.y)})">${tspans}</text>`;
 		})
 		.join('\n');
 
 	const rootName = model.nodes.get(model.root)?.name ?? model.root;
-	const rootMarkup = rootText
-		? `<text x="${round(cx)}" y="${round(cy - 2)}" font-size="13" font-weight="700" fill="#3a3550" text-anchor="middle">${escapeXml(
-				rootText
-		  )}</text>`
-		: '';
+	const rootMarkup =
+		rootLines.length > 0
+			? `<text x="${round(cx)}" y="${round(cy - 2)}" font-size="13" font-weight="700" fill="#3a3550" text-anchor="middle">${rootLines
+					.map((line, i) => {
+						const dy = i === 0 ? -((rootLines.length - 1) * rootLineHeight) / 2 : rootLineHeight;
+						return `<tspan x="${round(cx)}" dy="${round(dy)}">${escapeXml(line)}</tspan>`;
+					})
+					.join('')}</text>`
+			: '';
+	const subtitleY = rootLines.length > 1 ? cy + 30 : cy + 15;
 	const body = `<title>${escapeXml(`${rootName} — ${model.nodes.size} concepts`)}</title>
 <rect width="100%" height="100%" fill="#ffffff"/>
 <circle data-node="${escapeXml(rootName)}" cx="${round(cx)}" cy="${round(cy)}" r="${round(
 		centerRadius - 6
 	)}" fill="#f4f1ff" stroke="#b06cff" stroke-width="1.2"/>
 ${rootMarkup}
-<text x="${round(cx)}" y="${round(cy + 15)}" font-size="9.5" fill="#6b6480" text-anchor="middle">${
+<text x="${round(cx)}" y="${round(subtitleY)}" font-size="9.5" fill="#6b6480" text-anchor="middle">${
 		model.nodes.size
 	} concepts</text>
 ${arcMarkup}
