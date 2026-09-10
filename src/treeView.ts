@@ -13,7 +13,7 @@ import { PROVIDERS, curatedModelsFor, providerFor } from './types';
 import { normalizeKey } from './parser';
 import { ApiError } from './api';
 import type CogniTreePlugin from './main';
-import { buildJsonSnapshot, buildOutline, buildTreeSvg } from './exporters';
+import { buildJsonSnapshot, buildOutline, buildTreeSvg, computeDepths } from './exporters';
 import { AskModal } from './askModal';
 
 export const VIEW_TYPE = 'cognitree-view';
@@ -42,6 +42,8 @@ export class ConceptTreeView extends ItemView {
 	private scrollTop = 0;
 	private rafPending = false;
 	private jumpToFirstMatch = false;
+	/** True while a generate/batch/connection action is running (re-entrancy guard). */
+	private actionInFlight = false;
 
 	private tooltipEl!: HTMLElement;
 	private noMatchEl!: HTMLElement;
@@ -308,10 +310,38 @@ export class ConceptTreeView extends ItemView {
 		}
 		this.emptyEl.createDiv({
 			cls: 'ct-empty-hint',
-			text: this.plugin.settings.apiKey
-				? 'Each branch costs one API call — results are cached.'
-				: 'Tip: add your API key via ⚙ in the header first.',
+			text: this.needsApiKey()
+				? 'Tip: add your API key via ⚙ in the header first.'
+				: 'Each branch costs one API call — results are cached.',
 		});
+	}
+
+	/**
+	 * True when the configured endpoint needs a key we don't have. Local
+	 * providers (Ollama, LM Studio) are `keyRequired: false`, so they must not
+	 * be blocked by the Generate guard.
+	 */
+	private needsApiKey(): boolean {
+		const provider = providerFor(this.plugin.settings.modelEndpoint);
+		return provider?.keyRequired !== false && !this.plugin.settings.apiKey.trim();
+	}
+
+	/**
+	 * Long-running actions (generate / batch / connections) must not overlap:
+	 * a double-pressed Generate would issue two API calls and race on note
+	 * creation. Returns false when an action is already running.
+	 */
+	private beginAction(): boolean {
+		if (this.actionInFlight) {
+			new Notice('CogniTree is already working — wait for the current action to finish.', 4000);
+			return false;
+		}
+		this.actionInFlight = true;
+		return true;
+	}
+
+	private endAction(): void {
+		this.actionInFlight = false;
 	}
 
 	private debounceTimer = 0;
@@ -360,7 +390,10 @@ export class ConceptTreeView extends ItemView {
 	private autoExpand(model: TreeModel): void {
 		const depth = this.plugin.settings.autoExpandDepth;
 		if (depth <= 0) return;
+		const seen = new Set<string>();
 		const walk = (name: string, level: number) => {
+			if (seen.has(name)) return; // cycle-safe
+			seen.add(name);
 			const node = model.nodes.get(name);
 			if (!node || level > depth) return;
 			if (node.children.length > 0) {
@@ -404,10 +437,11 @@ export class ConceptTreeView extends ItemView {
 			await this.openTree(existing);
 			return;
 		}
-		if (!this.plugin.settings.apiKey) {
+		if (this.needsApiKey()) {
 			new Notice('Set your API key in CogniTree settings first (⚙ in the header).', 6000);
 			return;
 		}
+		if (!this.beginAction()) return;
 		this.setBusy(true, `Discovering "${concept}"…`);
 		try {
 			const result = await this.plugin.generator.discover(concept, (d) =>
@@ -430,6 +464,7 @@ export class ConceptTreeView extends ItemView {
 			this.handleError(err, `Discovery of "${concept}"`);
 		} finally {
 			this.setBusy(false);
+			this.endAction();
 		}
 	}
 
@@ -497,7 +532,10 @@ export class ConceptTreeView extends ItemView {
 	/** Expand every branch under a node — reveals freshly batch-generated nodes. */
 	private expandSubtree(name: string): void {
 		if (!this.model) return;
+		const seen = new Set<string>();
 		const visit = (n: string) => {
+			if (seen.has(n)) return; // cycle-safe
+			seen.add(n);
 			const node = this.model!.nodes.get(n);
 			if (!node || node.children.length === 0) return;
 			node.expanded = true;
@@ -532,6 +570,7 @@ export class ConceptTreeView extends ItemView {
 
 	private async runBatch(name: string, depth: number, budget: number): Promise<void> {
 		if (!this.model) return;
+		if (!this.beginAction()) return;
 		this.setBusy(true, `Batch expanding "${name}" to depth ${depth}…`);
 		try {
 			const { added, errors } = await this.plugin.generator.batch(
@@ -571,6 +610,7 @@ export class ConceptTreeView extends ItemView {
 		} finally {
 			this.setBusy(false);
 			this.setProgress(0, 0);
+			this.endAction();
 		}
 	}
 
@@ -607,6 +647,7 @@ export class ConceptTreeView extends ItemView {
 	private async findConnections(name: string): Promise<void> {
 		const node = this.model?.nodes.get(name);
 		if (!node) return;
+		if (!this.beginAction()) return;
 		this.setBusy(true, `Analyzing connections for "${name}"…`);
 		try {
 			const result = await this.plugin.generator.connections(node, (d) =>
@@ -621,6 +662,7 @@ export class ConceptTreeView extends ItemView {
 			this.handleError(err, `Connection discovery for "${name}"`);
 		} finally {
 			this.setBusy(false);
+			this.endAction();
 		}
 	}
 
@@ -726,6 +768,7 @@ export class ConceptTreeView extends ItemView {
 		if (!this.model) return;
 		const node = this.model.nodes.get(name);
 		if (!node) return;
+		const parentName = node.parent;
 		const count = this.plugin.store.collectSubtree(this.model, name).length;
 		new ConfirmModal(
 			this.app,
@@ -733,21 +776,15 @@ export class ConceptTreeView extends ItemView {
 			async () => {
 				// Capture the subtree contents so the delete can be undone.
 				const snap: { name: string; file: string; content: string }[] = [];
-				const files = new Map<string, string>();
-				const pathOf = new Map<string, string>();
-				const visit = (n: string) => {
-					const node = this.model!.nodes.get(n);
-					if (!node) return;
-					files.set(node.file, node.name);
-					pathOf.set(node.name, node.file);
-					for (const c of node.children) visit(c);
-				};
-				visit(name);
-				for (const [file, fname] of files) {
+				for (const sub of this.plugin.store.collectSubtree(this.model!, name)) {
 					try {
-						const fileRef = this.app.vault.getAbstractFileByPath(file);
+						const fileRef = this.app.vault.getAbstractFileByPath(sub.file);
 						if (fileRef instanceof TFile) {
-							snap.push({ name: fname, file, content: await this.app.vault.cachedRead(fileRef) });
+							snap.push({
+								name: sub.name,
+								file: sub.file,
+								content: await this.app.vault.cachedRead(fileRef),
+							});
 						}
 					} catch {
 						// Skip notes that can't be read; they can't be restored either.
@@ -764,17 +801,17 @@ export class ConceptTreeView extends ItemView {
 					}
 				).addButton({
 					text: 'Undo',
-					onClick: () => void this.restoreSubtree(name, snap, pathOf),
+					onClick: () => void this.restoreSubtree(name, parentName, snap),
 				});
 			}
 		).open();
 	}
 
-	/** Recreate notes captured before a subtree deletion. */
+	/** Recreate notes captured before a subtree deletion (the view's Undo). */
 	private async restoreSubtree(
 		name: string,
-		snap: { name: string; file: string; content: string }[],
-		pathOf: Map<string, string>
+		parentName: string | null,
+		snap: { name: string; file: string; content: string }[]
 	): Promise<void> {
 		try {
 			let restored = 0;
@@ -785,6 +822,12 @@ export class ConceptTreeView extends ItemView {
 				restored++;
 			}
 			if (restored > 0) {
+				// deleteSubtree dropped the node from its parent's `children`, so
+				// without re-linking it the restored notes would exist on disk but
+				// stay unreachable (and invisible) in the tree.
+				if (parentName && this.model) {
+					await this.plugin.store.relinkChild(this.model, parentName, name);
+				}
 				await this.refreshAll();
 			}
 			new Notice(`Restored ${restored} note${restored === 1 ? '' : 's'}.`, 5000);
@@ -805,7 +848,10 @@ export class ConceptTreeView extends ItemView {
 			// Filtered view: emit matching nodes AND their ancestor chain, so the
 			// hierarchy stays readable even when matches are deep in the tree.
 			const include = new Set<string>();
+			const collected = new Set<string>();
 			const collect = (name: string, path: string[]) => {
+				if (collected.has(name)) return; // cycle-safe
+				collected.add(name);
 				const node = this.model!.nodes.get(name);
 				if (!node) return;
 				if (node.name.toLowerCase().includes(this.filter)) {
@@ -815,7 +861,10 @@ export class ConceptTreeView extends ItemView {
 				for (const c of node.children) collect(c, [...path, name]);
 			};
 			collect(this.model.root, []);
+			const emitted = new Set<string>();
 			const emit = (name: string, depth: number) => {
+				if (emitted.has(name)) return; // cycle-safe
+				emitted.add(name);
 				const node = this.model!.nodes.get(name);
 				if (!node || !include.has(name)) return;
 				out.push({
@@ -827,7 +876,10 @@ export class ConceptTreeView extends ItemView {
 			};
 			emit(this.model.root, 0);
 		} else {
+			const visited = new Set<string>();
 			const visit = (name: string, depth: number) => {
+				if (visited.has(name)) return; // cycle-safe
+				visited.add(name);
 				const node = this.model!.nodes.get(name);
 				if (!node) return;
 				out.push({ name, depth });
@@ -887,9 +939,10 @@ export class ConceptTreeView extends ItemView {
 		let maxDepth = 0;
 		if (this.model) {
 			nodes = this.model.nodes.size;
-			for (const n of this.model.nodes.values()) {
-				const d = n.path.split('/').filter(Boolean).length;
-				if (d > maxDepth) maxDepth = d;
+			// Real BFS depth (root = 1) — the stored `path` contains the domain
+			// slug, so splitting it overstates the tree.
+			for (const d of computeDepths(this.model).values()) {
+				if (d + 1 > maxDepth) maxDepth = d + 1;
 			}
 		}
 		const chip = (label: string, value?: string, dot = false) => {
@@ -1231,32 +1284,38 @@ export class ConceptTreeView extends ItemView {
 		if (!this.model) return;
 		const subtree = this.plugin.store.collectSubtree(this.model, name);
 		if (subtree.length === 0) return;
+		if (!this.beginAction()) return;
 		this.setBusy(true, `Finding connections across ${subtree.length} node${subtree.length > 1 ? 's' : ''}…`);
 		let done = 0;
 		let linked = 0;
-		for (const node of subtree) {
-			done++;
-			this.setBusy(
-				true,
-				`Connections ${done}/${subtree.length} — "${node.name}"`
-			);
-			try {
-				const result = await this.plugin.generator.connections(node, (d) =>
-					this.setBusy(true, `Connections ${done}/${subtree.length} — ${d.slice(-40)}`)
+		try {
+			for (const node of subtree) {
+				done++;
+				this.setBusy(
+					true,
+					`Connections ${done}/${subtree.length} — "${node.name}"`
 				);
-				if (!result) continue;
-				for (const s of result.connections ?? []) {
-					if ((s.priority ?? 'medium').toLowerCase() !== 'high') continue;
-					if (this.app.metadataCache.getFirstLinkpathDest(s.name, '') !== null) {
-						const added = await this.plugin.store.addConnectionLink(node, s.name);
-						if (added) linked++;
+				try {
+					const result = await this.plugin.generator.connections(node, (d) =>
+						this.setBusy(true, `Connections ${done}/${subtree.length} — ${d.slice(-40)}`)
+					);
+					if (!result) continue;
+					for (const s of result.connections ?? []) {
+						if ((s.priority ?? 'medium').toLowerCase() !== 'high') continue;
+						if (this.app.metadataCache.getFirstLinkpathDest(s.name, '') !== null) {
+							const added = await this.plugin.store.addConnectionLink(node, s.name);
+							if (added) linked++;
+						}
 					}
+				} catch (err) {
+					console.warn(`Connections for "${node.name}" failed:`, err);
 				}
-			} catch (err) {
-				console.warn(`Connections for "${node.name}" failed:`, err);
 			}
+		} finally {
+			this.setStatus('');
+			this.setBusy(false);
+			this.endAction();
 		}
-		this.setStatus('');
 		new Notice(
 			`Batch connections: ${linked} link${linked === 1 ? '' : 's'} added across ${subtree.length} node${subtree.length === 1 ? '' : 's'}.`,
 			6000
@@ -1523,6 +1582,7 @@ class StatsModal extends Modal {
 		contentEl.createEl('h3', { text: `Tree stats — "${this.model.root}"` });
 
 		const m = this.model;
+		const depths = computeDepths(m);
 		let nodes = 0;
 		let leaves = 0;
 		let expandable = 0;
@@ -1534,7 +1594,7 @@ class StatsModal extends Modal {
 
 		for (const n of m.nodes.values()) {
 			nodes++;
-			const d = n.path.split('/').filter(Boolean).length;
+			const d = (depths.get(n.name) ?? 0) + 1;
 			byDepth.set(d, (byDepth.get(d) ?? 0) + 1);
 			if (d > maxDepth) maxDepth = d;
 			if (n.children.length === 0) leaves++;

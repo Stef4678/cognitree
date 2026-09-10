@@ -65,7 +65,6 @@ export class ApiClient {
 		let base = (this.settings.modelEndpoint || '').trim().replace(/\/+$/, '');
 		if (!base) base = 'https://api.deepseek.com';
 		if (base.endsWith('/chat/completions')) return base;
-		if (base.endsWith('/v1')) return `${base}/chat/completions`;
 		return `${base}/chat/completions`;
 	}
 
@@ -167,7 +166,11 @@ export class ApiClient {
 				}[];
 			};
 			const choice = data?.choices?.[0];
-			const text = choice?.message?.content ?? '';
+			// Some providers return content as an array of parts; only a string
+			// is usable, and coercing it here keeps the parser from throwing an
+			// opaque "text.trim is not a function".
+			const rawContent = choice?.message?.content;
+			const text = typeof rawContent === 'string' ? rawContent : '';
 			if (!text) {
 				if (choice?.message?.reasoning_content) {
 					throw new ReasoningTruncatedError(

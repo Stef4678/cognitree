@@ -5,14 +5,12 @@ import { ResponseCache } from './cache';
 import type { VaultIndexer } from './indexer';
 import { extractJSON, hashString, normalizeComplexity, normalizeKey, titleCase } from './parser';
 import {
-	buildBatchPrompt,
 	buildConnectionPrompt,
 	buildDiscoveryPrompt,
 	buildExpansionPrompt,
 } from './prompts';
 import type { ConceptStore } from './store';
 import type {
-	BatchResult,
 	ChildConcept,
 	ConnectionResult,
 	DiscoveryResult,
@@ -81,7 +79,9 @@ export class ConceptGenerator {
 
 	private parse<T>(raw: string, kind: string): T {
 		const parsed = extractJSON<T>(raw);
-		if (!parsed) {
+		// `extractJSON` only accepts JSON objects; guard here too so a stray
+		// array can never masquerade as a successful parse.
+		if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
 			throw new ApiError(
 				`The model did not return valid JSON for ${kind}. Raw response (first 300 chars): ${raw.slice(0, 300)}`
 			);
@@ -181,10 +181,12 @@ export class ConceptGenerator {
 
 	/**
 	 * Batch expansion to a target depth using repeated Expansion prompts with
-	 * bounded concurrency, level by level (BFS). `budget` caps the total
-	 * number of generated nodes (the Batch prompt itself is used only as an
-	 * optional fast first pass; per-node Expansion prompts are the scalable
-	 * path for tens of thousands of nodes).
+	 * bounded concurrency, level by level (BFS). `depth` is the number of levels
+	 * generated below the start node (1 = expand the start node only).
+	 * `budget` caps the total number of generated nodes and is checked before
+	 * every expansion, not just between levels; because up to CONCURRENCY
+	 * expansions can already be in flight, the final count may exceed it by at
+	 * most CONCURRENCY × maxChildrenPerLevel.
 	 */
 	async batch(
 		rootName: string,
@@ -208,15 +210,17 @@ export class ConceptGenerator {
 		let jobsRun = 0;
 		let jobsTotal = 0;
 
-		// Frontier of (node, level) pairs to expand at the current depth.
+		// Frontier of (node, level) pairs to expand. The start node sits at
+		// level 0, so a node at level L is expanded when L < targetDepth and
+		// targetDepth is exactly the number of generated levels.
 		let frontier: { name: string; level: number }[] = [
-			{ name: startNode ?? model.root, level: 1 },
+			{ name: startNode ?? model.root, level: 0 },
 		];
 		const visited = new Set<string>();
 
 		const CONCURRENCY = 3;
 
-		while (frontier.length > 0 && added + visited.size < cap) {
+		while (frontier.length > 0 && added < cap) {
 			if (signal?.aborted) break;
 
 			// Pick jobs at this level that still need expansion.
@@ -231,7 +235,7 @@ export class ConceptGenerator {
 					jobs.push(item);
 				}
 				// Descend into already-expanded children regardless.
-				if (item.level < targetDepth) {
+				if (item.level + 1 < targetDepth) {
 					for (const c of node.children) {
 						next.push({ name: c, level: item.level + 1 });
 					}
@@ -247,16 +251,20 @@ export class ConceptGenerator {
 
 			let idx = 0;
 			const worker = async () => {
-				while (idx < jobs.length && !signal?.aborted) {
+				while (idx < jobs.length && !signal?.aborted && added < cap) {
 					const job = jobs[idx++];
 					try {
 						const node = model.nodes.get(job.name)!;
-						this.progress(onProgress, jobsRun, jobsTotal, `Expanding "${job.name}" (level ${job.level})…`);
+						this.progress(onProgress, jobsRun, jobsTotal, `Expanding "${job.name}" (level ${job.level + 1})…`);
 						const { created } = await this.expand(node, model, onDelta);
 						added += created.length;
 						for (const child of created) {
 							model.nodes.set(child.name, child);
-							next.push({ name: child.name, level: job.level + 1 });
+							// Only queue the next level when it is still within
+							// the requested depth.
+							if (job.level + 1 < targetDepth) {
+								next.push({ name: child.name, level: job.level + 1 });
+							}
 						}
 					} catch (err) {
 						errors.push(`${job.name}: ${(err as Error).message}`);
@@ -272,51 +280,6 @@ export class ConceptGenerator {
 		}
 
 		return { added, errors };
-	}
-
-	/** Use the Batch Generation prompt for a fast first pass (root → depth). */
-	async batchFirstPass(
-		rootName: string,
-		depth: number,
-		maxNodes: number,
-		onDelta?: (d: string) => void
-	): Promise<{ added: number; skipped: number }> {
-		const s = this.settings();
-		const prompt = buildBatchPrompt({
-			root: rootName,
-			depth: Math.max(1, Math.min(depth, 3)),
-			maxNodes: Math.max(1, Math.min(maxNodes, s.maxNodesPerBatch)),
-		});
-		const raw = await this.runPrompt('batch', prompt.system, prompt.user, onDelta);
-		const result = this.parse<BatchResult>(raw, 'batch');
-		const nodes = (result.nodes || []).filter((n) => n && n.name && n.path);
-
-		const model = await this.store.loadTree(rootName);
-		if (!model) throw new ApiError(`Tree "${rootName}" not found.`);
-
-		// Group batch nodes by their first path segment under the root.
-		let added = 0;
-		let skipped = 0;
-		const parent = model.nodes.get(model.root)!;
-		const children: ChildConcept[] = nodes
-			.filter((n) => {
-				const segs = (n.path || '').split('/').filter(Boolean);
-				return segs.length >= 2;
-			})
-			.map((n) => ({
-				name: titleCase(n.name),
-				description: n.description || '',
-				connections: (n.connections || []).filter(Boolean),
-			}));
-		const { created, skipped: sk } = await this.store.addChildren(
-			parent,
-			children,
-			s.treeFolder,
-			model.nodes
-		);
-		added += created.length;
-		skipped += sk.length;
-		return { added, skipped };
 	}
 
 	// ---------------------------------------------------------------- 5. Follow-up chat

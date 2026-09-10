@@ -21,6 +21,12 @@ export interface BranchDigest {
 	omitted: number;
 }
 
+/** Truncate a line of context so one huge description can't dominate the digest. */
+function clipText(s: string, max: number): string {
+	const oneLine = s.replace(/\s+/g, ' ').trim();
+	return oneLine.length > max ? oneLine.slice(0, max) + '…' : oneLine;
+}
+
 /**
  * Build a compact branch digest around `focusName`:
  * the focus node with its tree position, its descendants BFS-ordered, and —
@@ -41,13 +47,15 @@ export function buildBranchDigest(
 
 	// Focus line with its position in the tree (root ▸ … ▸ focus).
 	const chain: string[] = [];
+	const chainSeen = new Set<string>();
 	let cursor: typeof focus | null = focus;
-	while (cursor) {
+	while (cursor && !chainSeen.has(cursor.name)) {
+		chainSeen.add(cursor.name); // frontmatter cycles must not hang the walk
 		chain.unshift(cursor.name);
 		cursor = cursor.parent ? (model.nodes.get(cursor.parent) ?? null) : null;
 	}
 	out.push(`Focus: "${focus.name}" (${chain.join(' ▸ ')})`);
-	if (focus.description) out.push(`Description: ${focus.description}`);
+	if (focus.description) out.push(`Description: ${clipText(focus.description, 400)}`);
 	if (focus.domain) out.push(`Domain: ${focus.domain} · Complexity: ${focus.complexity}`);
 
 	// Notes the focus already links to outside this tree (vault neighbours).
@@ -57,7 +65,9 @@ export function buildBranchDigest(
 	}
 
 	const limit = Math.max(1, maxNodes);
-	let used = 0; // chars used by the numbered list so far
+	// Every line above counts against the character budget too — otherwise a
+	// single long description could push the digest far past maxChars.
+	let used = out.reduce((n, l) => n + l.length + 1, 0);
 	let omitted = 0;
 	const lines: string[] = [];
 	const descOf = (n: (typeof focus) | null): string => {
@@ -172,7 +182,9 @@ export function parseSuggestedChildren(markdown: string): SuggestedChild[] {
 	for (const raw of lines) {
 		const trimmed = raw.trim();
 		if (!trimmed) {
-			if (inSection) break; // a blank line ends the list
+			// Blank lines inside the section are tolerated (models routinely
+			// put one right after the heading); the list ends at the first
+			// non-bullet line instead.
 			continue;
 		}
 		if (!inSection) {

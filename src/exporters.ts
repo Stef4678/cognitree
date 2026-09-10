@@ -24,10 +24,35 @@ function escapeXml(s: string): string {
 	});
 }
 
+/**
+ * Breadth-first depth of every node reachable from the root (root = 0).
+ * Cycle-safe, and independent of the stored `path` — that path contains the
+ * domain slug, so splitting it overstates the real tree depth.
+ */
+export function computeDepths(model: TreeModel): Map<string, number> {
+	const depths = new Map<string, number>();
+	if (!model.nodes.has(model.root)) return depths;
+	depths.set(model.root, 0);
+	const queue: string[] = [model.root];
+	while (queue.length > 0) {
+		const name = queue.shift()!;
+		const d = depths.get(name)!;
+		for (const c of model.nodes.get(name)?.children ?? []) {
+			if (depths.has(c) || !model.nodes.has(c)) continue;
+			depths.set(c, d + 1);
+			queue.push(c);
+		}
+	}
+	return depths;
+}
+
 /** Indented [[wikilink]] outline of the whole tree. */
 export function buildOutline(model: TreeModel): string {
 	const lines: string[] = [];
+	const seen = new Set<string>();
 	const visit = (name: string, depth: number) => {
+		if (seen.has(name)) return; // cycle-safe
+		seen.add(name);
 		const node = model.nodes.get(name);
 		if (!node) return;
 		lines.push(`${'  '.repeat(depth)}- [[${node.name}]]`);
@@ -69,40 +94,38 @@ interface LayoutNode {
 /** Layered SVG diagram of the tree (nodes + curved parent→child connectors). */
 export function buildTreeSvg(model: TreeModel): string {
 	const nodes = model.nodes;
-	const depth = new Map<string, number>();
+	const depth = computeDepths(model);
 	const leafSpan = new Map<string, number>();
 	const layout = new Map<string, LayoutNode>();
 
-	const assignDepth = (name: string, d: number) => {
-		const n = nodes.get(name);
-		if (!n) return;
-		depth.set(name, d);
-		for (const c of n.children) assignDepth(c, d + 1);
-	};
-	assignDepth(model.root, 0);
-
-	const span = (name: string): number => {
+	const span = (name: string, open: Set<string>): number => {
 		const n = nodes.get(name);
 		if (!n) return 0;
+		if (open.has(name)) return 0; // frontmatter cycle: stop descending
+		open.add(name);
 		if (n.children.length === 0) {
 			leafSpan.set(name, LEAF_W);
+			open.delete(name);
 			return LEAF_W;
 		}
 		let s = 0;
-		for (const c of n.children) s += span(c);
+		for (const c of n.children) s += span(c, open);
 		const sp = Math.max(s, 120);
 		leafSpan.set(name, sp);
+		open.delete(name);
 		return sp;
 	};
-	span(model.root);
+	span(model.root, new Set());
 
 	const boxW = (name: string) => Math.max(MIN_W, Math.min(240, name.length * 7.2 + 22));
 
 	let minX = 0;
 	let maxX = 0;
-	const place = (name: string, left: number): number => {
+	const place = (name: string, left: number, open: Set<string>): number => {
 		const n = nodes.get(name);
 		if (!n) return 0;
+		if (open.has(name)) return 0; // cycle guard (mirrors span())
+		open.add(name);
 		const sp = leafSpan.get(name) ?? LEAF_W;
 		const cx = left + sp / 2;
 		const w = boxW(name);
@@ -111,12 +134,13 @@ export function buildTreeSvg(model: TreeModel): string {
 		minX = Math.min(minX, x);
 		maxX = Math.max(maxX, x + w);
 		let cur = left;
-		for (const c of n.children) cur += place(c, cur);
+		for (const c of n.children) cur += place(c, cur, open);
+		open.delete(name);
 		return sp;
 	};
-	place(model.root, 0);
+	place(model.root, 0, new Set());
 
-	const maxDepth = Math.max(0, ...[...depth.values()]);
+	const maxDepth = Math.max(0, ...depth.values());
 	const totalW = maxX - minX + PAD * 2;
 	const totalH = maxDepth * LAYER_GAP + NODE_H + PAD * 2;
 	const shiftX = PAD - minX;

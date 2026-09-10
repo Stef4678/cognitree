@@ -96,6 +96,20 @@ export class ConceptStore {
 				(typeof fm.name === 'string' && fm.name.trim()) ||
 				file.basename;
 			const node = this.frontmatterToNode(name, fm, file.path);
+			// Nodes are keyed by concept name, so two notes claiming the same
+			// concept (a "Name (2).md" leftover, a hand-duplicated note, two
+			// trees sharing a sanitized folder name) would silently shadow each
+			// other. Keep the canonical file and warn instead of losing a note
+			// without a trace.
+			const existing = nodes.get(node.name);
+			if (existing) {
+				const keepNew = !matchStem(existing.file, node.name) && matchStem(file.path, node.name);
+				console.warn(
+					`CogniTree: "${file.path}" duplicates the concept "${node.name}" already loaded from "${existing.file}"` +
+						(keepNew ? ' — keeping the canonical filename.' : ' — keeping the first one.')
+				);
+				if (!keepNew) continue;
+			}
 			nodes.set(node.name, node);
 		}
 
@@ -212,8 +226,16 @@ export class ConceptStore {
 	}
 
 	private async resolveFileFor(node: TreeNode): Promise<string> {
-		const folder = this.treeFolder(node.treeRoot);
-		const stem = sanitizeFileName(node.name);
+		return this.uniqueVaultPath(this.treeFolder(node.treeRoot), node.name);
+	}
+
+	/**
+	 * First free `<folder>/<stem>.md` (stem, stem (2), …). Shared by note
+	 * creation and subtree merges so a filename collision never has to skip or
+	 * overwrite an existing note.
+	 */
+	private uniqueVaultPath(folder: string, name: string): string {
+		const stem = sanitizeFileName(name);
 		let file = `${folder}/${stem}.md`;
 		let n = 2;
 		while (this.app.vault.getAbstractFileByPath(file) instanceof TFile && n < 1000) {
@@ -372,8 +394,13 @@ export class ConceptStore {
 	 * Merge the duplicate `source` subtree into `target` (in `targetModel`):
 	 * descendant notes move into the target tree re-parented under `target`,
 	 * and `source`'s children are absorbed into `target`'s children (deduped).
-	 * The source root's note is deleted. Skips descendants whose filename
-	 * would collide with an existing target-tree note (avoids overwrites).
+	 *
+	 * A descendant whose *concept* already exists in the target tree is left
+	 * where it is (the tree model is keyed by concept name, so moving it would
+	 * shadow one of the two) and returned in `skipped`; a mere filename
+	 * collision moves under a unique name instead of being skipped. Either way
+	 * every rewritten `children` list only references notes that are actually
+	 * reachable, so a merge can never strand a note behind a deleted parent.
 	 */
 	async mergeSubtree(
 		source: TreeModel,
@@ -385,17 +412,22 @@ export class ConceptStore {
 		const targetNode = target.nodes.get(targetName);
 		if (!node || !targetNode) return { moved: 0, skipped: [`"${sourceName}" not found`] };
 
+		const targetConcepts = new Set([...target.nodes.keys()].map(normalizeKey));
 		const moved: TreeNode[] = [];
 		const skipped: string[] = [];
 		for (const d of this.collectSubtree(source, sourceName)) {
 			if (d === node) continue;
+			if (targetConcepts.has(normalizeKey(d.name))) {
+				// Already represented in the target tree — keep the source copy.
+				skipped.push(d.name);
+				continue;
+			}
 			const rel = d.path.startsWith(node.path)
 				? d.path.slice(node.path.length)
 				: `/${slugify(d.name)}`;
-			const newFile = `${target.folder}/${sanitizeFileName(d.name)}.md`;
-			if (this.app.vault.getAbstractFileByPath(newFile) instanceof TFile) {
-				skipped.push(d.name);
-				continue;
+			const newFile = this.uniqueVaultPath(target.folder, d.name);
+			if (!matchStem(newFile, d.name)) {
+				console.warn(`CogniTree: merged "${d.name}" as "${newFile}" (filename already in use).`);
 			}
 			const oldFile = d.file;
 			d.treeRoot = targetNode.treeRoot;
@@ -408,9 +440,19 @@ export class ConceptStore {
 			moved.push(d);
 		}
 
+		const movedNames = new Set(moved.map((n) => n.name));
+
+		// A moved note must not list a child that stayed behind.
+		for (const m of moved) {
+			const kept = m.children.filter((c) => movedNames.has(c) || target.nodes.has(c));
+			if (kept.length !== m.children.length) {
+				m.children = kept;
+				await this.writeNode(m);
+			}
+		}
+
 		// Absorb source children into the target (dedup by normalized name).
 		const have = new Set(targetNode.children.map(normalizeKey));
-		const movedNames = new Set(moved.map((n) => n.name));
 		for (const c of node.children) {
 			const k = normalizeKey(c);
 			if (have.has(k)) continue;
@@ -422,7 +464,7 @@ export class ConceptStore {
 		}
 		await this.writeNode(targetNode);
 
-		// Remove source from its parent's children and delete the duplicate note.
+		// Remove source from its parent's children.
 		if (node.parent) {
 			const p = source.nodes.get(node.parent);
 			if (p) {
@@ -430,16 +472,27 @@ export class ConceptStore {
 				await this.writeNode(p);
 			}
 		}
-		const dupFile = this.app.vault.getAbstractFileByPath(node.file);
-		if (dupFile instanceof TFile) await this.app.fileManager.trashFile(dupFile);
+
+		// Keep the source note when anything was left behind (it is still the
+		// parent of the skipped concepts); otherwise it is a pure duplicate.
+		node.children = node.children.filter((c) => !movedNames.has(c));
+		if (skipped.length > 0) {
+			await this.writeNode(node);
+		} else {
+			const dupFile = this.app.vault.getAbstractFileByPath(node.file);
+			if (dupFile instanceof TFile) await this.app.fileManager.trashFile(dupFile);
+		}
 
 		return { moved: moved.length, skipped };
 	}
 
-	/** Collect a node plus all descendants (recursive). */
+	/** Collect a node plus all descendants (recursive, cycle-safe). */
 	collectSubtree(model: TreeModel, name: string): TreeNode[] {
 		const out: TreeNode[] = [];
+		const seen = new Set<string>();
 		const visit = (n: string) => {
+			if (seen.has(n)) return; // frontmatter cycles must not hang the walk
+			seen.add(n);
 			const node = model.nodes.get(n);
 			if (!node) return;
 			out.push(node);
@@ -468,8 +521,25 @@ export class ConceptStore {
 				await this.writeNode(p);
 			}
 		}
-		model.nodes.delete(name);
+		// Drop the whole subtree from the in-memory model, not just the root —
+		// otherwise the deleted descendants keep inflating the node count.
+		for (const node of nodes) model.nodes.delete(node.name);
 		return nodes.length;
+	}
+
+	/**
+	 * Re-attach `childName` to its parent's `children` list and persist the
+	 * parent note. Used by the view's Undo, which recreates the deleted notes:
+	 * without this the restored subtree stays orphaned and invisible because
+	 * the parent note no longer lists it.
+	 */
+	async relinkChild(model: TreeModel, parentName: string, childName: string): Promise<boolean> {
+		const parent = model.nodes.get(parentName);
+		if (!parent) return false;
+		if (parent.children.some((c) => normalizeKey(c) === normalizeKey(childName))) return false;
+		parent.children.push(childName);
+		await this.writeNode(parent);
+		return true;
 	}
 
 	/** Open the backing note in a new tab. */
@@ -496,12 +566,7 @@ export class ConceptStore {
 			await this.app.vault.createFolder(folder);
 		}
 		const stem = sanitizeFileName(conceptName);
-		let file = `${folder}/${stem}.md`;
-		let n = 2;
-		while (this.app.vault.getAbstractFileByPath(file) instanceof TFile && n < 1000) {
-			file = `${folder}/${stem} (${n}).md`;
-			n++;
-		}
+		const file = this.uniqueVaultPath(folder, stem);
 		const node: TreeNode = {
 			name: conceptName,
 			parent: parentConcept ?? null,
@@ -529,4 +594,10 @@ export class ConceptStore {
 function titleTrim(s: string): string {
 	const t = String(s ?? '').trim().replace(/\s+/g, ' ');
 	return t || 'Concept';
+}
+
+/** True when `filePath`'s stem is the canonical `<sanitized name>.md` for `name`. */
+function matchStem(filePath: string, name: string): boolean {
+	const base = filePath.split('/').pop() ?? '';
+	return base.toLowerCase() === `${sanitizeFileName(name)}.md`.toLowerCase();
 }

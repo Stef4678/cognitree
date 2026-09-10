@@ -1,4 +1,4 @@
-import type { App, TFile, MetadataCache } from 'obsidian';
+import type { App, EventRef, TFile, MetadataCache } from 'obsidian';
 import { normalizeKey } from './parser';
 
 /**
@@ -12,22 +12,54 @@ export class VaultIndexer {
 	private index = new Map<string, string>(); // normalized name -> note name (display)
 	private excludedFolder = 'CogniTree';
 	private rebuildTimer: number | null = null;
+	private refs: EventRef[] = [];
+	private subscribed = false;
 	private ready = false;
 
 	constructor(private app: App) {}
 
+	/**
+	 * Configure the index and subscribe to metadataCache events. Safe to call
+	 * repeatedly: the subscription is created once (the settings tab calls
+	 * this whenever the tree folder changes).
+	 */
 	init(excludedFolder: string): void {
 		this.excludedFolder = excludedFolder;
 		this.rebuild();
-
-		const debounced = () => {
-			if (this.rebuildTimer !== null) window.clearTimeout(this.rebuildTimer);
-			this.rebuildTimer = window.setTimeout(() => this.rebuild(), 1500);
-		};
-		this.app.metadataCache.on('changed', debounced);
-		this.app.metadataCache.on('deleted', debounced);
-		this.app.metadataCache.on('resolved', debounced);
+		if (this.subscribed) return;
+		const debounced = () => this.scheduleRebuild();
+		this.refs = [
+			this.app.metadataCache.on('changed', debounced),
+			this.app.metadataCache.on('deleted', debounced),
+			this.app.metadataCache.on('resolved', debounced),
+		];
+		this.subscribed = true;
 		this.ready = true;
+	}
+
+	/** Point the index at a new excluded folder without blocking on a rebuild. */
+	setExcludedFolder(folder: string): void {
+		this.excludedFolder = folder;
+		this.scheduleRebuild();
+	}
+
+	/** Detach the metadataCache listeners (called when the plugin unloads). */
+	dispose(): void {
+		for (const ref of this.refs) this.app.metadataCache.offref(ref);
+		this.refs = [];
+		this.subscribed = false;
+		if (this.rebuildTimer !== null) {
+			window.clearTimeout(this.rebuildTimer);
+			this.rebuildTimer = null;
+		}
+	}
+
+	private scheduleRebuild(): void {
+		if (this.rebuildTimer !== null) window.clearTimeout(this.rebuildTimer);
+		this.rebuildTimer = window.setTimeout(() => {
+			this.rebuildTimer = null;
+			this.rebuild();
+		}, 1500);
 	}
 
 	rebuild(): void {

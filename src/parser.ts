@@ -5,23 +5,12 @@ import type { Complexity } from './types';
  * Robust helpers for parsing LLM output and producing safe file names / YAML.
  */
 
-/** Strip markdown fences and trailing prose, then extract the first balanced JSON object. */
-export function extractJSON<T = unknown>(text: string): T | null {
-	if (!text) return null;
-	let s = text.trim();
-
-	// Strip ```json ... ``` fences (any fence flavor).
-	const fenceMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
-	if (fenceMatch) s = fenceMatch[1].trim();
-
-	const start = s.indexOf('{');
-	if (start === -1) return null;
-	// If the response was truncated (no closing brace), repair the tail.
-	let end = s.lastIndexOf('}');
-	if (end <= start) end = s.length - 1;
-	s = s.slice(start, end + 1);
-
-	const attempts: (() => unknown)[] = [
+/**
+ * Equivalence-class helper: the repair strategies tried against one JSON slice,
+ * cheapest first.
+ */
+function jsonStrategies(s: string): (() => unknown)[] {
+	return [
 		// 1. Direct parse.
 		(): unknown => JSON.parse(s),
 		// 2. Tolerate trailing commas (a very common LLM slip).
@@ -33,16 +22,83 @@ export function extractJSON<T = unknown>(text: string): T | null {
 		//    missing commas, truncated tails, …
 		(): unknown => JSON.parse(jsonrepair(s)),
 	];
+}
 
-	for (const attempt of attempts) {
-		try {
-			const value = attempt();
-			// The prompts always demand an object; a repaired primitive is garbage.
-			if (typeof value === 'object' && value !== null) {
-				return value as T;
+/**
+ * Index of the `}` that closes the object opened at `start`, skipping braces
+ * inside string literals (and their backslash escapes). -1 when unterminated.
+ */
+function closingBrace(s: string, start: number): number {
+	let depth = 0;
+	let inString = false;
+	for (let i = start; i < s.length; i++) {
+		const ch = s[i];
+		if (inString) {
+			if (ch === '\\') i++;
+			else if (ch === '"') inString = false;
+			continue;
+		}
+		if (ch === '"') inString = true;
+		else if (ch === '{') depth++;
+		else if (ch === '}') {
+			depth--;
+			if (depth === 0) return i;
+		}
+	}
+	return -1;
+}
+
+/**
+ * Every complete top-level `{…}` span in `s`, longest first (ties keep document
+ * order). Longest-first means a full payload beats a schema skeleton the model
+ * echoed first; spans that only look like objects (`{democracy}` in prose) are
+ * returned too and simply fail to parse.
+ */
+export function balancedJsonObjects(s: string): string[] {
+	const found: { start: number; text: string }[] = [];
+	let i = 0;
+	while (i < s.length) {
+		const start = s.indexOf('{', i);
+		if (start === -1) break;
+		const end = closingBrace(s, start);
+		if (end === -1) break; // unterminated tail — the caller repairs it
+		found.push({ start, text: s.slice(start, end + 1) });
+		i = end + 1;
+	}
+	return found
+		.slice()
+		.sort((a, b) => b.text.length - a.text.length || a.start - b.start)
+		.map((f) => f.text);
+}
+
+/** Strip markdown fences and trailing prose, then extract the first balanced JSON object. */
+export function extractJSON<T = unknown>(text: string): T | null {
+	if (!text) return null;
+	let s = text.trim();
+
+	// Strip ```json ... ``` fences (any fence flavor).
+	const fenceMatch = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+	if (fenceMatch) s = fenceMatch[1].trim();
+
+	const start = s.indexOf('{');
+	if (start === -1) return null;
+
+	// Complete objects first; a truncated response (nothing balanced) falls
+	// back to the tail from the first `{` so jsonrepair can close it.
+	const candidates = balancedJsonObjects(s);
+	if (candidates.length === 0) candidates.push(s.slice(start));
+
+	for (const candidate of candidates) {
+		for (const attempt of jsonStrategies(candidate)) {
+			try {
+				const value = attempt();
+				// The prompts always demand an object; a repaired primitive is garbage.
+				if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+					return value as T;
+				}
+			} catch {
+				/* try next strategy */
 			}
-		} catch {
-			/* try next strategy */
 		}
 	}
 	return null;
@@ -240,7 +296,9 @@ export function slugify(s: string): string {
 	return (s || '')
 		.trim()
 		.toLowerCase()
-		.replace(/[^a-z0-9]+/g, '_')
+		// Unicode-aware: non-Latin concept names keep their letters instead of
+		// collapsing to an empty slug (which produced "//" path segments).
+		.replace(/[^\p{L}\p{N}]+/gu, '_')
 		.replace(/^_+|_+$/g, '');
 }
 
@@ -274,7 +332,9 @@ export function toInt(v: unknown, fallback: number): number {
 		return Number.isFinite(t) ? t : fallback;
 	}
 	const n = Number(v);
-	return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+	// `>= 0`: a legitimate zero (e.g. estimated_depth: 0) must not be coerced
+	// into the fallback.
+	return Number.isFinite(n) && n >= 0 ? Math.round(n) : fallback;
 }
 
 export function toBool(v: unknown, fallback: boolean): boolean {

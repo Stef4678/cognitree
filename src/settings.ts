@@ -48,7 +48,7 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 					def('Model endpoint', 'Base URL of an OpenAI-compatible chat API (set automatically by the provider presets).', (s) => this.buildEndpointRow(s)),
 					def('Model', 'Models for the selected provider (curated + fetched via GET /models). Choose “Custom…” to type any id.', (s) => this.buildModelRow(s)),
 					def('Temperature', 'Sampling temperature for generation (0 = deterministic, 1 = creative).', (s) => this.buildTemperatureRow(s)),
-					def('Streaming responses', 'Show live streaming text during generation. Disable for simpler debugging.', (s) => this.buildStreamingRow(s)),
+					def('Streaming responses', 'Request a streaming (SSE) response. Obsidian buffers the body, so text is revealed progressively once the request completes. Disable for simpler debugging.', (s) => this.buildStreamingRow(s)),
 					def('Max tokens per request', 'Token cap for a single generation call. Default: 4000. Raise it if reasoning models keep hitting the limit.', (s) => this.buildMaxTokensRow(s)),
 				],
 			},
@@ -158,8 +158,10 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 			...new Set([...curatedModelsFor(s.modelEndpoint), ...(this.plugin.data.models ?? [])]),
 		];
 		const isKnown = known.includes(s.model);
-		// The custom-model row is appended right below the model setting.
-		const container = setting.settingEl.parentElement ?? setting.settingEl;
+		// The custom-model row is appended right below the model setting; fall
+		// back to the tab container when the setting is not attached yet (the
+		// declarative renderer may call render() before inserting the row).
+		const container = setting.settingEl.parentElement ?? this.containerEl;
 
 		setting
 			.setName('Model')
@@ -236,7 +238,9 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 	private buildStreamingRow(setting: Setting): void {
 		setting
 			.setName('Streaming responses')
-			.setDesc('Show live streaming text during generation. Disable for simpler debugging.')
+			.setDesc(
+				'Request a streaming (SSE) response. Obsidian buffers the body, so the text is revealed progressively once the request completes. Disable for simpler debugging.'
+			)
 			.addToggle((t) =>
 				t.setValue(this.plugin.settings.streaming).onChange(async (v) => {
 					this.plugin.settings.streaming = v;
@@ -414,7 +418,8 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						this.plugin.settings.treeFolder = v.trim() || 'CogniTree';
 						await this.plugin.saveSettings();
-						this.plugin.indexer?.init(this.plugin.settings.treeFolder);
+						// Debounced inside the indexer — this fires per keystroke.
+						this.plugin.indexer?.setExcludedFolder(this.plugin.settings.treeFolder);
 					})
 			);
 	}

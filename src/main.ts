@@ -37,6 +37,9 @@ export default class CogniTreePlugin extends Plugin {
 		this.store.setBaseFolder(this.settings.treeFolder);
 		this.indexer = new VaultIndexer(this.app);
 		this.indexer.init(this.settings.treeFolder);
+		// metadataCache listeners are attached outside the plugin lifecycle, so
+		// detach them explicitly on unload.
+		this.register(() => this.indexer.dispose());
 		this.cache = new ResponseCache(
 			() => Promise.resolve(this.data),
 			() => this.saveData(this.data),
