@@ -14,7 +14,7 @@ import { PROVIDERS, curatedModelsFor, providerFor } from './types';
 import { normalizeKey, titleCase } from './parser';
 import { ApiError } from './api';
 import type CogniTreePlugin from './main';
-import { buildJsonSnapshot, buildOutline, buildTreeSvg, computeDepths } from './exporters';
+import { buildJsonSnapshot, buildOutline, buildRadialSvg, buildTreeSvg, computeDepths } from './exporters';
 import { AskModal } from './askModal';
 import {
 	GRADES,
@@ -2492,11 +2492,12 @@ class ExportModal extends Modal {
 				await this.plugin.app.vault.create(path, content);
 			}
 		};
-		const add = (label: string, file: string, build: () => string) => {
+		const add = (label: string, file: string, build: () => string, hint?: string) => {
 			const btn = contentEl.createEl('button', {
 				cls: 'ct-btn ct-btn-block',
 				text: `Export as ${label}`,
 			});
+			if (hint) contentEl.createDiv({ cls: 'ct-modal-hint ct-export-hint', text: hint });
 			btn.addEventListener('click', () => {
 				void (async () => {
 					try {
@@ -2510,9 +2511,30 @@ class ExportModal extends Modal {
 				})();
 			});
 		};
-		add('Markdown outline', 'outline.md', () => buildOutline(this.model));
-		add('JSON snapshot', 'tree.json', () => buildJsonSnapshot(this.model));
-		add('SVG graph', 'tree.svg', () => buildTreeSvg(this.model));
+		add(
+			'Markdown outline',
+			'outline.md',
+			() => buildOutline(this.model),
+			'Nested [[wikilinks]] — paste into a map-of-content note.'
+		);
+		add(
+			'JSON snapshot',
+			'tree.json',
+			() => buildJsonSnapshot(this.model),
+			'Every node with its metadata, for scripts or backups.'
+		);
+		add(
+			'SVG graph (layered)',
+			'tree.svg',
+			() => buildTreeSvg(this.model),
+			'Depth in rows — best for narrow, deep trees.'
+		);
+		add(
+			'SVG sunburst (radial)',
+			'sunburst.svg',
+			() => buildRadialSvg(this.model),
+			'Depth as rings, arc width = branch size — best for wide trees.'
+		);
 
 		const close = contentEl.createEl('button', { cls: 'ct-btn ct-btn-block', text: 'Close' });
 		close.addEventListener('click', () => this.close());

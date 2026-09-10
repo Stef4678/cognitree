@@ -732,6 +732,177 @@ import {
 	assert(noteTags(cache({}, [])).length === 0, 'noteTags: no tags → empty list');
 }
 
+// --- radial sunburst export ----------------------------------------------
+import { analyseTree, buildRadialSvg } from '../src/exporters';
+
+{
+	/** Sanity-check a generated SVG: finite geometry, every node drawn, nothing clipped. */
+	const assertSvgSane = (label: string, svg: string, expectedNodes: number): void => {
+		assert(svg.startsWith('<svg') && svg.trimEnd().endsWith('</svg>'), `${label}: is an svg document`);
+		const bad = svg.match(/NaN|undefined|Infinity/);
+		assert(!bad, `${label}: finite geometry${bad ? ` (found ${bad[0]})` : ''}`);
+		const viewBox = svg.match(/viewBox="0 0 ([\d.]+) ([\d.]+)"/);
+		assert(!!viewBox, `${label}: has a viewBox`);
+		const width = Number(viewBox?.[1] ?? 0);
+		const height = Number(viewBox?.[2] ?? 0);
+		assert(
+			width > 0 && height > 0 && width === Number(svg.match(/width="(\d+)"/)?.[1]),
+			`${label}: viewBox matches the declared size`
+		);
+		const drawn = new Set([...svg.matchAll(/data-node="([^"]*)"/g)].map((m) => m[1]));
+		assert(drawn.size === expectedNodes, `${label}: drew every node (${drawn.size}/${expectedNodes})`);
+
+		const num = (tag: string, attr: string): number | null => {
+			const raw = tag.match(new RegExp(`\\b${attr}="([^"]+)"`))?.[1];
+			if (raw === undefined || raw.endsWith('%')) return null;
+			const value = Number(raw);
+			return Number.isFinite(value) ? value : null;
+		};
+		let outside = 0;
+		for (const match of svg.matchAll(/<rect\b[^>]*>/g)) {
+			const x = num(match[0], 'x');
+			const y = num(match[0], 'y');
+			const w = num(match[0], 'width');
+			const h = num(match[0], 'height');
+			if (x === null || y === null || w === null || h === null) continue;
+			if (x < -0.5 || y < -0.5 || x + w > width + 0.5 || y + h > height + 0.5) outside++;
+		}
+		for (const match of svg.matchAll(/<circle\b[^>]*>/g)) {
+			const cx = num(match[0], 'cx');
+			const cy = num(match[0], 'cy');
+			const r = num(match[0], 'r');
+			if (cx === null || cy === null || r === null) continue;
+			if (cx - r < -0.5 || cy - r < -0.5 || cx + r > width + 0.5 || cy + r > height + 0.5) outside++;
+		}
+		assert(outside === 0, `${label}: nothing drawn outside the viewBox (${outside} outside)`);
+	};
+
+	const node = (name: string, parent: string | null, children: string[] = []): TreeNode => ({
+		name,
+		parent,
+		description: 'd',
+		complexity: 'Beginner',
+		canExpand: true,
+		estimatedDepth: 3,
+		connections: [],
+		children,
+		path: `/${name.toLowerCase()}`,
+		created: 0,
+		file: `f/${name}.md`,
+		treeRoot: 'Root',
+		expanded: false,
+		loading: false,
+	});
+
+	// Uneven branches: A holds 3 leaves, B holds 1 — spans must follow the weight.
+	const model: TreeModel = {
+		root: 'Root',
+		folder: 'f',
+		updatedAt: 0,
+		nodes: new Map([
+			['Root', node('Root', null, ['A', 'B'])],
+			['A', node('A', 'Root', ['A1', 'A2', 'A3'])],
+			['A1', node('A1', 'A')],
+			['A2', node('A2', 'A')],
+			['A3', node('A3', 'A')],
+			['B', node('B', 'Root', ['B1'])],
+			['B1', node('B1', 'B')],
+		]),
+	};
+
+	const analysis = analyseTree(model);
+	assert(analysis.maxDepth === 2, `analyseTree: max depth (got ${analysis.maxDepth})`);
+	assert(analysis.weight.get('Root') === 4, 'analyseTree: root weight counts leaves');
+	assert(analysis.weight.get('A') === 3 && analysis.weight.get('B') === 1, 'analyseTree: branch weights');
+	assert(analysis.weight.get('A1') === 1, 'analyseTree: a leaf weighs 1');
+	assert(analysis.branch.get('A2') === 1 && analysis.branch.get('B1') === 2, 'analyseTree: branch index per node');
+	assert(analysis.order.join(',') === 'Root,A,B,A1,A2,A3,B1', `analyseTree: breadth-first order (${analysis.order.join(',')})`);
+
+	const svg = buildRadialSvg(model);
+	assertSvgSane('sunburst', svg, model.nodes.size);
+	assert(svg.includes('7 concepts'), 'sunburst: reports the node count');
+	assert((svg.match(/<path /g) ?? []).length === 6, 'sunburst: one arc per non-root node');
+
+	// A bigger branch must occupy a wider arc than a smaller sibling: recover the
+	// start/end angles of each depth-1 arc from its path and compare spans.
+	const size = Number(svg.match(/width="(\d+)"/)![1]);
+	const centerX = size / 2;
+	const centerY = size / 2 + 10;
+	const spanOf = (name: string): number => {
+		const match = svg.match(
+			new RegExp(
+				`<path data-node="${name}" d="M ([\\d.]+) ([\\d.-]+) A [\\d.]+ [\\d.]+ 0 [01] 1 ([\\d.]+) ([\\d.-]+)`
+			)
+		);
+		if (!match) return Number.NaN;
+		const start = Math.atan2(Number(match[2]) - centerY, Number(match[1]) - centerX);
+		const end = Math.atan2(Number(match[4]) - centerY, Number(match[3]) - centerX);
+		let sweep = end - start;
+		while (sweep < 0) sweep += Math.PI * 2;
+		return sweep;
+	};
+	const spanA = spanOf('A');
+	const spanB = spanOf('B');
+	assert(
+		Math.abs(spanA - Math.PI * 1.5) < 0.1,
+		`sunburst: a 3-leaf branch spans 3/4 of the circle (got ${spanA.toFixed(2)} rad)`
+	);
+	assert(
+		Math.abs(spanB - Math.PI * 0.5) < 0.1,
+		`sunburst: a 1-leaf branch spans 1/4 (got ${spanB.toFixed(2)} rad)`
+	);
+	assert(spanA > spanB * 2, 'sunburst: the bigger branch gets the wider arc');
+
+	// Edge cases: a lone root, a deep chain, and a frontmatter cycle.
+	const solo: TreeModel = { root: 'Solo', folder: 'f', updatedAt: 0, nodes: new Map([['Solo', node('Solo', null)]]) };
+	assertSvgSane('sunburst (single node)', buildRadialSvg(solo), 1);
+
+	const chain = new Map<string, TreeNode>();
+	for (let i = 0; i < 9; i++) {
+		const name = `L${i}`;
+		chain.set(name, node(name, i === 0 ? null : `L${i - 1}`, i < 8 ? [`L${i + 1}`] : []));
+	}
+	const deep: TreeModel = { root: 'L0', folder: 'f', updatedAt: 0, nodes: chain };
+	assertSvgSane('sunburst (deep chain)', buildRadialSvg(deep), 9);
+	assert(analyseTree(deep).maxDepth === 8, 'analyseTree: handles a nine-level chain');
+
+	const cyclic: TreeModel = {
+		root: 'Root',
+		folder: 'f',
+		updatedAt: 0,
+		nodes: new Map([
+			['Root', node('Root', null, ['A', 'B'])],
+			['A', node('A', 'Root', ['B'])],
+			['B', node('B', 'A', ['A'])],
+		]),
+	};
+	assert(analyseTree(cyclic).weight.get('Root')! >= 1, 'analyseTree: terminates on a cycle');
+	assertSvgSane('sunburst (cycle)', buildRadialSvg(cyclic), 3);
+
+	// Long names are ellipsised rather than allowed to run across the canvas.
+	const longName = 'A very long concept name that will not fit inside a ring sector';
+	const longModel: TreeModel = {
+		root: 'Root',
+		folder: 'f',
+		updatedAt: 0,
+		nodes: new Map([
+			['Root', node('Root', null, [longName])],
+			[longName, node(longName, 'Root')],
+		]),
+	};
+	const longSvg = buildRadialSvg(longModel);
+	assertSvgSane('sunburst (long name)', longSvg, 2);
+	assert(
+		!longSvg.includes(`>${longName}<`),
+		'sunburst: long labels are not emitted as text in full'
+	);
+	assert(longSvg.includes('…'), 'sunburst: truncated labels are marked with an ellipsis');
+	assert(
+		longSvg.includes(`data-node="${longName}"`),
+		'sunburst: the full name is still kept in the data-node attribute'
+	);
+}
+
 // --- report --------------------------------------------------------------
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} TEST(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

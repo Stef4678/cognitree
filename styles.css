@@ -791,6 +791,10 @@ body.theme-light {
 	width: min(640px, 92vw);
 }
 
+.ct-export-hint {
+	margin: -6px 0 10px;
+}
+
 .ct-review {
 	display: flex;
 	flex-direction: column;

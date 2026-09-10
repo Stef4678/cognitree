@@ -35,7 +35,7 @@ Built around a **prompt system** (Discovery, Expansion, Connection Discovery, De
 | **Filter that jumps** | Type in the search box: matching nodes keep their ancestor chain, matches are highlighted, and the view jumps to the first hit; a *No matching nodes* hint appears when nothing matches |
 | **Copy link / path** | Right-click → **Copy [[link]]** or **Copy note path** |
 | **Safe delete with undo** | Right-click → **Delete node + descendants**, then press **Undo** on the notice to recreate every deleted note *and* re-attach the branch to its parent. Reference nodes never delete the notes they point at |
-| **Export tree** | Right-click → **Export tree…** → Markdown outline, JSON snapshot, or SVG graph, written to the vault root |
+| **Export tree** | Right-click → **Export tree…** → Markdown outline, JSON snapshot, SVG graph (layered) or SVG sunburst (radial), written to the vault root. The sunburst puts depth in rings and sizes each arc by the number of concepts in that branch — the right shape for wide trees |
 | **Batch connections** | Right-click → **Find connections in subtree** — runs the connection pass over every node and auto-links high-priority hits |
 | **Tree stats & health** | Right-click → **Tree stats & health** — depth distribution, complexity breakdown, orphaned / dangling-node detection |
 | **Duplicate detection** | Right-click → **Find duplicates across trees** — lists concepts present in 2+ trees with **Link** and **Merge A→B / B→A** actions |
