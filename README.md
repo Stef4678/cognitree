@@ -2,7 +2,7 @@
 
 AI-powered **branching knowledge trees** for Obsidian. Type a single concept ("democracy", "tree", "consciousness") and a polymathic-taxonomist LLM grows it into a deep, interconnected tree of notes — one branch at a time, up to tens of thousands of nodes.
 
-Built around a **four-prompt system** (Discovery, Expansion, Connection Discovery, Batch Generation) and designed for **large-scale scalability**: incremental growth, Markdown+frontmatter storage, response caching, background indexing via Obsidian's `metadataCache`, and virtualized rendering.
+Built around a **prompt system** (Discovery, Expansion, Connection Discovery, plus a Batch Generation builder) and designed for **large-scale scalability**: incremental growth, Markdown+frontmatter storage, response caching, background indexing via Obsidian's `metadataCache`, and virtualized rendering.
 
 ---
 
@@ -64,7 +64,7 @@ Mirrors the spec's `PluginSettings`:
 | `modelEndpoint` | `https://api.deepseek.com` | Base URL (`/chat/completions` is appended if missing) |
 | `model` | `deepseek-v4-flash` | Model id — dropdown lists the provider's curated models + anything fetched via `GET /models`; **Custom…** accepts any id |
 | `temperature` | `0.7` | Sampling temperature |
-| `streaming` | `true` | Live text during generation |
+| `streaming` | `true` | Request SSE streaming (Obsidian buffers the body, so text is revealed when the request completes) |
 | `maxTokensPerRequest` | `4000` | Token cap per call (reasoning models auto-retry with a larger budget if they run out mid-reasoning) |
 | `maxChildrenPerLevel` | `7` | Children cap per expansion |
 | `maxDepth` | `10` | Deepest auto/batch expansion level |
@@ -88,7 +88,7 @@ The prompts from the spec are implemented verbatim in [`src/prompts.ts`](src/pro
 1. **Discovery Prompt** — *"You are a polymathic taxonomist and knowledge graph engineer…"* — 3–7 domains, 3–5 children each, complexity ratings, connection hints, `suggested_starting_branch`. Strict JSON schema.
 2. **Expansion Prompt** — *"You are a knowledge graph engineer specializing in deep taxonomic expansion…"* — 5–10 granular children, sibling de-duplication context, `can_expand` + `estimated_depth` depth indicators.
 3. **Connection Discovery Prompt** — *"You are a knowledge graph analyst…"* — ranked candidate vault notes, `relationship_type` (parent-of / related-to / contrast-with…), High/Medium/Low priority, suggestions for concepts to create.
-4. **Batch Generation Prompt** — *"You are a batch knowledge expansion specialist…"* — complete subtree to a depth within a node budget (`path`-based hierarchical output).
+4. **Batch Generation Prompt** — *"You are a batch knowledge expansion specialist…"* — complete subtree to a depth within a node budget (`path`-based hierarchical output). *Builder only:* no UI action sends it today — **⚡ Batch** generates the subtree with repeated Expansion prompts, one branch at a time (`ConceptGenerator.batch`), which is what keeps the node budget and progress bar honest.
 5. **Follow-up (Ask) Prompt** — *"You are CogniTree Ask…"* — a grounded tutor over the focused node's branch digest. Answers stay anchored in the digest (plus linked vault notes), keep Markdown short, and — when the answer proposes new sub-concepts — end with a `### Suggested children` bullet list that the chat can adopt into the tree.
 
 Responses are parsed tolerantly (markdown-fence stripping, trailing-comma repair, balanced-brace extraction) in [`src/parser.ts`](src/parser.ts).
@@ -137,7 +137,10 @@ This stays fully Obsidian-native: the graph view, backlinks, and search all work
 npm install          # dev deps (esbuild, typescript, obsidian types)
 npm run dev          # watch mode → main.js
 npm run build        # typecheck + production bundle
+npm test             # pure-logic suite + store/generator suite (in-memory vault stub)
 ```
+
+`tests/smoke.ts` covers the obsidian-free helpers (parser, prompts, providers, branch digest). `tests/store.test.ts` runs the real `ConceptStore` / `ConceptGenerator` against `tests/stub-obsidian.ts` — an in-memory vault, metadataCache and fileManager — so note writing, subtree deletes/undo and batch expansion are testable without an Obsidian install.
 
 ## Keyboard shortcuts
 
