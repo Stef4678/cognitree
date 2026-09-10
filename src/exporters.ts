@@ -144,49 +144,93 @@ export interface RadialOptions {
 	maxLabelLength?: number;
 	/** Angular padding between sibling arcs, in radians. */
 	gap?: number;
+	/** Font size of the ring labels; also drives the width estimate. */
+	labelFontSize?: number;
+}
+
+/** Rough advance width per character for the label font stack (deliberately generous). */
+const CHAR_WIDTH_EM = 0.58;
+
+export interface RadialArc {
+	name: string;
+	depth: number;
+	/** Top-level branch index (root = 0) — picks the colour. */
+	branch: number;
+	inner: number;
+	outer: number;
+	/** Angular start/end of the drawn arc (gaps already applied). */
+	from: number;
+	to: number;
+}
+
+export interface RadialLabel {
+	name: string;
+	/** The (possibly ellipsised) text actually drawn. */
+	text: string;
+	/** Angle of the arc's middle. */
+	angle: number;
+	/** Radius the text is centred on. */
+	radius: number;
+	/** Rotation in degrees, already flipped so it is never upside down. */
+	rotation: number;
+	fontSize: number;
+	/** Angular half-width this text needs at `radius`. */
+	halfAngle: number;
+	/** Arc length available inside the node's own arc, in px. */
+	arcLength: number;
+}
+
+export interface RadialLayout {
+	size: number;
+	cx: number;
+	cy: number;
+	centerRadius: number;
+	ringWidth: number;
+	arcs: RadialArc[];
+	labels: RadialLabel[];
+	/** Root disc label (null when even a short name cannot fit). */
+	rootText: string | null;
+	/** Nodes left unlabelled because their arc could not hold readable text. */
+	unlabelled: string[];
 }
 
 /**
- * Radial sunburst of the tree: depth is the radius, and the angular width of a
- * node is proportional to the number of concepts in its subtree.
+ * Geometry for the radial sunburst: depth is the radius and the angular width of
+ * a node is proportional to the number of concepts in its subtree.
  *
- * This is the layout to reach for when a tree is wide rather than deep — the
- * layered SVG grows with the number of leaves (a 33-node tree can be ~3200px
- * wide for 292px of height), while the sunburst stays roughly square and makes
- * "which branch is biggest" obvious at a glance.
+ * Kept separate from the SVG rendering so the invariant that matters — a label
+ * never spills over its neighbours — can be asserted directly in tests. Labels
+ * are drawn tangentially at a fixed radius, so a label is only emitted when the
+ * text actually fits inside its own arc; otherwise it is shortened, and dropped
+ * entirely when not even a few characters fit.
  */
-export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): string {
+export function radialLayout(model: TreeModel, options: RadialOptions = {}): RadialLayout {
 	const { depth, weight, branch, maxDepth } = analyseTree(model);
 	const centerRadius = Math.max(24, options.centerRadius ?? 74);
 	const ringWidth = Math.max(20, options.ringWidth ?? 104);
 	const maxLabelLength = Math.max(6, options.maxLabelLength ?? 22);
 	const gap = Math.max(0, options.gap ?? 0.008);
+	const fontSize = Math.max(6, options.labelFontSize ?? 10.5);
 
 	const outer = centerRadius + maxDepth * ringWidth + 26;
 	const size = Math.round(outer * 2 + 40);
 	const cx = size / 2;
 	const cy = size / 2 + 10;
 
-	const point = (radius: number, angle: number): [number, number] => [
-		cx + radius * Math.cos(angle),
-		cy + radius * Math.sin(angle),
-	];
-	const round = (value: number): string => value.toFixed(2);
-	const arcPath = (inner: number, outerRadius: number, from: number, to: number): string => {
-		const large = to - from > Math.PI ? 1 : 0;
-		const [x0, y0] = point(outerRadius, from);
-		const [x1, y1] = point(outerRadius, to);
-		const [x2, y2] = point(inner, to);
-		const [x3, y3] = point(inner, from);
-		return `M ${round(x0)} ${round(y0)} A ${round(outerRadius)} ${round(outerRadius)} 0 ${large} 1 ${round(
-			x1
-		)} ${round(y1)} L ${round(x2)} ${round(y2)} A ${round(inner)} ${round(inner)} 0 ${large} 0 ${round(
-			x3
-		)} ${round(y3)} Z`;
+	const textWidth = (text: string, size2: number): number => text.length * size2 * CHAR_WIDTH_EM;
+	/** Fit `name` into `available` px, or null when nothing readable fits. */
+	const fit = (name: string, available: number, size2: number): string | null => {
+		if (available < 20) return null;
+		const maxChars = Math.floor(available / (size2 * CHAR_WIDTH_EM));
+		if (maxChars < 4) return null;
+		const capped = name.length > maxLabelLength ? `${name.slice(0, maxLabelLength - 1)}…` : name;
+		if (capped.length <= maxChars) return capped;
+		return `${name.slice(0, maxChars - 1)}…`;
 	};
 
-	const arcs: string[] = [];
-	const labels: string[] = [];
+	const arcs: RadialArc[] = [];
+	const labels: RadialLabel[] = [];
+	const unlabelled: string[] = [];
 	// A node is drawn once even if hand-edited frontmatter lists it under two
 	// parents (or in a cycle) — without this the walk recurses forever.
 	const drawn = new Set<string>();
@@ -199,33 +243,35 @@ export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): s
 		if (nodeDepth > 0) {
 			const inner = centerRadius + (nodeDepth - 1) * ringWidth;
 			const outerRadius = inner + ringWidth - 4;
-			const hue = branch.get(name) ?? 1;
-			arcs.push(
-				`<path data-node="${escapeXml(name)}" d="${arcPath(
-					inner,
-					outerRadius,
-					from + gap,
-					to - gap
-				)}" fill="${branchFill(hue, nodeDepth)}" stroke="${branchStroke(
-					hue
-				)}" stroke-width="0.8" stroke-opacity="0.5"/>`
-			);
-			// Only label an arc with room for the text to be readable.
-			if (to - from > 0.16) {
-				const mid = (from + to) / 2;
-				const [lx, ly] = point(inner + (ringWidth - 4) / 2, mid);
-				const degrees = (mid * 180) / Math.PI;
-				const flipped = degrees > 90 && degrees < 270;
-				const rotation = flipped ? degrees + 180 : degrees;
-				const text =
-					node.name.length > maxLabelLength
-						? `${node.name.slice(0, maxLabelLength - 1)}…`
-						: node.name;
-				labels.push(
-					`<text x="${round(lx)}" y="${round(ly)}" font-size="10.5" fill="#2c2740" text-anchor="middle" transform="rotate(${round(
-						rotation
-					)} ${round(lx)} ${round(ly)})">${escapeXml(text)}</text>`
-				);
+			const arc: RadialArc = {
+				name,
+				depth: nodeDepth,
+				branch: branch.get(name) ?? 1,
+				inner,
+				outer: outerRadius,
+				from: from + gap,
+				to: to - gap,
+			};
+			arcs.push(arc);
+
+			const angle = (from + to) / 2;
+			const radius = inner + (ringWidth - 4) / 2;
+			const arcLength = Math.max(0, arc.to - arc.from) * radius;
+			const text = fit(node.name, arcLength - 8, fontSize);
+			if (text) {
+				const degrees = (angle * 180) / Math.PI;
+				labels.push({
+					name,
+					text,
+					angle,
+					radius,
+					rotation: degrees > 90 && degrees < 270 ? degrees + 180 : degrees,
+					fontSize,
+					halfAngle: textWidth(text, fontSize) / 2 / radius,
+					arcLength,
+				});
+			} else {
+				unlabelled.push(name);
 			}
 		}
 
@@ -251,19 +297,83 @@ export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): s
 	}
 
 	const rootName = model.nodes.get(model.root)?.name ?? model.root;
+	// The root label sits in a disc, so it has to fit the chord across it.
+	const rootText = fit(rootName, 2 * (centerRadius - 12), 13);
+
+	return { size, cx, cy, centerRadius, ringWidth, arcs, labels, rootText, unlabelled };
+}
+
+/**
+ * Radial sunburst of the tree as an SVG string.
+ *
+ * This is the layout to reach for when a tree is wide rather than deep — the
+ * layered SVG grows with the number of leaves (a 33-node tree can be ~3200px
+ * wide for 292px of height), while the sunburst stays roughly square and makes
+ * "which branch is biggest" obvious at a glance. Only labels that fit inside
+ * their own arc are drawn, so dense rings stay readable.
+ */
+export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): string {
+	const layout = radialLayout(model, options);
+	const { size, cx, cy, centerRadius, arcs, labels, rootText } = layout;
+	const round = (value: number): string => value.toFixed(2);
+	const point = (radius: number, angle: number): [number, number] => [
+		cx + radius * Math.cos(angle),
+		cy + radius * Math.sin(angle),
+	];
+	const arcPath = (inner: number, outerRadius: number, from: number, to: number): string => {
+		const large = to - from > Math.PI ? 1 : 0;
+		const [x0, y0] = point(outerRadius, from);
+		const [x1, y1] = point(outerRadius, to);
+		const [x2, y2] = point(inner, to);
+		const [x3, y3] = point(inner, from);
+		return `M ${round(x0)} ${round(y0)} A ${round(outerRadius)} ${round(outerRadius)} 0 ${large} 1 ${round(
+			x1
+		)} ${round(y1)} L ${round(x2)} ${round(y2)} A ${round(inner)} ${round(inner)} 0 ${large} 0 ${round(
+			x3
+		)} ${round(y3)} Z`;
+	};
+
+	const arcMarkup = arcs
+		.map(
+			(arc) =>
+				`<path data-node="${escapeXml(arc.name)}" d="${arcPath(
+					arc.inner,
+					arc.outer,
+					arc.from,
+					arc.to
+				)}" fill="${branchFill(arc.branch, arc.depth)}" stroke="${branchStroke(
+					arc.branch
+				)}" stroke-width="0.8" stroke-opacity="0.5"/>`
+		)
+		.join('\n');
+	const labelMarkup = labels
+		.map((label) => {
+			const [lx, ly] = point(label.radius, label.angle);
+			return `<text x="${round(lx)}" y="${round(ly)}" font-size="${
+				label.fontSize
+			}" fill="#2c2740" text-anchor="middle" transform="rotate(${round(label.rotation)} ${round(
+				lx
+			)} ${round(ly)})">${escapeXml(label.text)}</text>`;
+		})
+		.join('\n');
+
+	const rootName = model.nodes.get(model.root)?.name ?? model.root;
+	const rootMarkup = rootText
+		? `<text x="${round(cx)}" y="${round(cy - 2)}" font-size="13" font-weight="700" fill="#3a3550" text-anchor="middle">${escapeXml(
+				rootText
+		  )}</text>`
+		: '';
 	const body = `<title>${escapeXml(`${rootName} — ${model.nodes.size} concepts`)}</title>
 <rect width="100%" height="100%" fill="#ffffff"/>
 <circle data-node="${escapeXml(rootName)}" cx="${round(cx)}" cy="${round(cy)}" r="${round(
 		centerRadius - 6
 	)}" fill="#f4f1ff" stroke="#b06cff" stroke-width="1.2"/>
-<text x="${round(cx)}" y="${round(cy - 2)}" font-size="13" font-weight="700" fill="#3a3550" text-anchor="middle">${escapeXml(
-		rootName
-	)}</text>
+${rootMarkup}
 <text x="${round(cx)}" y="${round(cy + 15)}" font-size="9.5" fill="#6b6480" text-anchor="middle">${
 		model.nodes.size
 	} concepts</text>
-${arcs.join('\n')}
-${labels.join('\n')}`;
+${arcMarkup}
+${labelMarkup}`;
 
 	return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" font-family="Inter, system-ui, sans-serif">
 ${body}

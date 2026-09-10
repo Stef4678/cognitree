@@ -733,7 +733,7 @@ import {
 }
 
 // --- radial sunburst export ----------------------------------------------
-import { analyseTree, buildRadialSvg } from '../src/exporters';
+import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 
 {
 	/** Sanity-check a generated SVG: finite geometry, every node drawn, nothing clipped. */
@@ -852,6 +852,120 @@ import { analyseTree, buildRadialSvg } from '../src/exporters';
 		`sunburst: a 1-leaf branch spans 1/4 (got ${spanB.toFixed(2)} rad)`
 	);
 	assert(spanA > spanB * 2, 'sunburst: the bigger branch gets the wider arc');
+
+	// Dense rings: labels are drawn tangentially at a fixed radius, so a label
+	// that does not fit its own arc runs over its neighbours. The layout must
+	// shorten it to fit — and drop it when nothing readable fits.
+	{
+		const eq = (actual: unknown, expected: unknown, label: string): void =>
+			assert(actual === expected, `${label} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`);
+		const countOverlaps = (layout: ReturnType<typeof radialLayout>): number => {
+			const rings = new Map<number, typeof layout.labels>();
+			for (const label of layout.labels) {
+				const key = Math.round(label.radius / 5);
+				rings.set(key, [...(rings.get(key) ?? []), label]);
+			}
+			let overlaps = 0;
+			for (const ring of rings.values()) {
+				for (let i = 0; i < ring.length; i++) {
+					for (let j = i + 1; j < ring.length; j++) {
+						let gap = Math.abs(ring[i].angle - ring[j].angle);
+						if (gap > Math.PI) gap = Math.PI * 2 - gap;
+						if (gap < ring[i].halfAngle + ring[j].halfAngle) overlaps++;
+					}
+				}
+			}
+			return overlaps;
+		};
+
+		// 14 long-named siblings: every arc can hold a shortened label.
+		const names = [
+			'Conservation of Energy',
+			'Thermodynamics in Chemistry',
+			'Energy Transformation',
+			'Activation Energy',
+			'Bond Energy',
+			'Kinetic Energy',
+			'Potential Energy',
+			'Thermal Energy',
+			'Chemical Energy',
+			'Nuclear Energy',
+			'Radiant Energy',
+			'Sound Energy',
+			'Elastic Energy',
+			'Gravitational Energy',
+		];
+		const dense: TreeModel = {
+			root: 'Energy',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Energy', node('Energy', null, names)],
+				...names.map((name) => [name, node(name, 'Energy')] as [string, TreeNode]),
+			]),
+		};
+		const layout = radialLayout(dense);
+		eq(layout.arcs.length, names.length, 'radialLayout: one arc per non-root node');
+		eq(layout.labels.length, names.length, 'radialLayout: a shortened label for every arc that fits');
+		let tooWide = 0;
+		for (const label of layout.labels) {
+			if (label.text.length * label.fontSize * 0.58 > label.arcLength + 0.5) tooWide++;
+		}
+		eq(tooWide, 0, 'radialLayout: every label fits inside its own arc');
+		eq(countOverlaps(layout), 0, 'radialLayout: no two labels in a ring overlap');
+		assert(
+			layout.labels.every((label) => label.text.endsWith('…')),
+			'radialLayout: dense labels are shortened, not left overflowing'
+		);
+		const denseSvg = buildRadialSvg(dense);
+		assertSvgSane('sunburst (dense ring)', denseSvg, dense.nodes.size);
+		eq(
+			[...denseSvg.matchAll(/<text [^>]*transform="rotate/g)].length,
+			layout.labels.length,
+			'sunburst: draws exactly the labels the layout kept'
+		);
+
+		// 40 tiny arcs: nothing readable fits, so those labels are dropped.
+		const many = Array.from({ length: 40 }, (_, i) => `Sub concept number ${i + 1}`);
+		const crowded: TreeModel = {
+			root: 'Crowded',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Crowded', node('Crowded', null, many)],
+				...many.map((name) => [name, node(name, 'Crowded')] as [string, TreeNode]),
+			]),
+		};
+		const crowdedLayout = radialLayout(crowded);
+		assert(
+			crowdedLayout.unlabelled.length > 0,
+			`radialLayout: drops labels that cannot fit (${crowdedLayout.unlabelled.length} of ${many.length})`
+		);
+		eq(
+			crowdedLayout.labels.length + crowdedLayout.unlabelled.length,
+			many.length,
+			'radialLayout: every arc is either labelled or reported as too small'
+		);
+		eq(countOverlaps(crowdedLayout), 0, 'radialLayout: crowded rings still do not overlap');
+		assertSvgSane('sunburst (crowded ring)', buildRadialSvg(crowded), crowded.nodes.size);
+
+		// The root label lives in the disc, so a long root name must be shortened too.
+		const longRoot: TreeModel = {
+			root: 'Thermodynamics in Chemistry',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Thermodynamics in Chemistry', node('Thermodynamics in Chemistry', null, ['Entropy'])],
+				['Entropy', node('Entropy', 'Thermodynamics in Chemistry')],
+			]),
+		};
+		const rootLayout = radialLayout(longRoot);
+		assert(
+			rootLayout.rootText !== null && rootLayout.rootText.endsWith('…'),
+			`radialLayout: a long root name is shortened for the disc (${rootLayout.rootText})`
+		);
+		assertSvgSane('sunburst (long root)', buildRadialSvg(longRoot), longRoot.nodes.size);
+	}
 
 	// Edge cases: a lone root, a deep chain, and a frontmatter cycle.
 	const solo: TreeModel = { root: 'Solo', folder: 'f', updatedAt: 0, nodes: new Map([['Solo', node('Solo', null)]]) };
