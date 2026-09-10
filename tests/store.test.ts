@@ -8,6 +8,8 @@ import { makeApp, TFile } from './stub-obsidian';
 import { ConceptStore } from '../src/store';
 import { ConceptGenerator } from '../src/generator';
 import { computeDepths } from '../src/exporters';
+import { addCards, gradeCard, reviewStats } from '../src/review';
+import { buildGraph, sourceMap } from '../src/vaultGraph';
 import { DEFAULT_SETTINGS, type DiscoveryResult, type TreeNode, type TreeModel } from '../src/types';
 
 let failures = 0;
@@ -317,6 +319,180 @@ async function main(): Promise<void> {
 		assert(
 			app.vault.files.has('CogniTree/Alpha/Shared.md'),
 			'the skipped note is not deleted from the source tree'
+		);
+	}
+
+	// ---------------------------------------------------------------- deep dives
+	{
+		const app = makeApp();
+		const store = new ConceptStore(app);
+		await store.createDiscoveryTree(DISCOVERY, 'CogniTree');
+		let model = (await store.loadTree('Democracy'))!;
+		const node = model.nodes.get('Direct Democracy')!;
+		const md = '### How it works\n\n- Initiative\n- Referendum';
+		await store.setDeepDive(node, md);
+		assert(node.deepened! > 0, 'setDeepDive marks the node as deepened');
+		assert(
+			app.vault.files.get(node.file)!.includes('## Deep dive'),
+			'the note gains a "## Deep dive" region'
+		);
+
+		// Every later rewrite rebuilds the body from the model — the region has
+		// to be carried over, or connections/expansions would delete it.
+		await store.addConnectionLink(node, 'Elections');
+		let file = app.vault.files.get(node.file)!;
+		assert(file.includes('- Referendum'), 'deep dive survives a connection-link rewrite');
+		assert(file.includes('deepened:'), 'the deepened timestamp is persisted in frontmatter');
+
+		model = (await store.loadTree('Democracy'))!;
+		const reloaded = model.nodes.get('Direct Democracy')!;
+		assert(reloaded.deepened! > 0, 'deepened survives a reload (read back from frontmatter)');
+		eq(await store.readDeepDive(reloaded), md, 'readDeepDive returns the stored Markdown');
+
+		await store.addChildren(reloaded, [{ name: 'Referendums', description: 'x' }], 'CogniTree', model.nodes);
+		file = app.vault.files.get(reloaded.file)!;
+		assert(file.includes('- Referendum'), 'deep dive survives an expansion rewrite of the parent note');
+
+		// Hand edits inside the region are the user's — keep them.
+		app.vault.files.set(reloaded.file, file.replace('- Referendum', '- Referendum (edited)'));
+		await store.addConnectionLink(reloaded, 'Ballots');
+		assert(
+			app.vault.files.get(reloaded.file)!.includes('(edited)'),
+			'hand edits inside the deep dive survive a rewrite'
+		);
+
+		await store.setDeepDive(reloaded, null);
+		assert(!app.vault.files.get(reloaded.file)!.includes('## Deep dive'), 'setDeepDive(null) removes the region');
+		assert(!reloaded.deepened, 'removing clears the deepened flag');
+		eq(await store.readDeepDive(reloaded), '', 'readDeepDive is empty after removal');
+	}
+
+	// ---------------------------------------------------------------- review store
+	{
+		const app = makeApp();
+		const store = new ConceptStore(app);
+		await store.createDiscoveryTree(DISCOVERY, 'CogniTree');
+
+		const fresh = await store.loadReview('Democracy');
+		eq(Object.keys(fresh.cards).length, 0, 'loadReview starts empty');
+		eq(fresh.tree, 'Democracy', 'loadReview carries the tree name');
+
+		const now = Date.now();
+		const { added } = addCards(
+			fresh,
+			'Direct Democracy',
+			[
+				{ question: 'What is a referendum?', answer: 'A direct vote.' },
+				{ question: 'What is sortition?', answer: 'Selection by lot.' },
+			],
+			now
+		);
+		eq(added, 2, 'addCards fills the store');
+		fresh.states[Object.keys(fresh.cards)[0]] = gradeCard(
+			undefined,
+			'good',
+			Object.keys(fresh.cards)[0],
+			now
+		);
+		await store.saveReview(fresh);
+
+		assert(
+			app.vault.files.has('CogniTree/Democracy/.cognitree-review.json'),
+			'the review store is written beside the tree notes'
+		);
+		const reloaded = await store.loadReview('Democracy');
+		eq(Object.keys(reloaded.cards).length, 2, 'cards persist in the review store');
+		eq(Object.keys(reloaded.states).length, 1, 'the schedule persists with the cards');
+		eq(reviewStats(reloaded, now).due, 1, 'one card is scheduled, one is new');
+		eq(reviewStats(reloaded, now).fresh, 1, 'the ungraded card counts as new');
+
+		// The hidden store must never be mistaken for a note of the tree.
+		const model = (await store.loadTree('Democracy'))!;
+		assert(
+			![...model.nodes.keys()].some((n) => n.includes('cognitree-review')),
+			'the review store is not loaded as a tree node'
+		);
+		eq((await store.loadReview('Nonexistent')).tree, 'Nonexistent', 'a missing tree yields an empty store');
+	}
+
+	// ---------------------------------------------------------------- vault cartography
+	{
+		const app = makeApp();
+		const store = new ConceptStore(app);
+		app.vault.folders.add('Notes');
+		app.vault.files.set('Notes/Greek Democracy.md', '# Greek Democracy\n\nOriginal note.\n');
+		app.vault.files.set('Notes/Sortition.md', '# Sortition\n\nOriginal note.\n');
+		const graph = buildGraph([
+			{ name: 'Greek Democracy', path: 'Notes/Greek Democracy.md', tags: ['#history'], links: [] },
+			{ name: 'Sortition', path: 'Notes/Sortition.md', tags: ['#history'], links: [] },
+		]);
+
+		const result: DiscoveryResult = {
+			concept: 'Democracy Notes',
+			domains: [
+				{
+					name: 'Origins',
+					children: [
+						{ name: 'Ancient Greece', description: 'Early practice.', source: 'Greek Democracy' },
+						{ name: 'Selection by lot', description: '', source: 'Sortition' },
+						{ name: 'Hallucinated note', description: 'x', source: 'No Such Note' },
+						{ name: 'New concept', description: 'Generated child.' },
+					],
+				},
+			],
+		};
+		const res = await store.createVaultTree(
+			result,
+			'CogniTree',
+			sourceMap(graph),
+			'Notes/Greek Democracy.md'
+		);
+		eq(res.linked, 2, 'createVaultTree links only notes that really exist');
+		eq(res.created.length, 4, 'createVaultTree creates every mapped child');
+
+		const model = (await store.loadTree('Democracy Notes'))!;
+		eq(model.root, 'Democracy Notes', 'the vault tree loads like any other tree');
+		eq(
+			model.nodes.get('Democracy Notes')!.source,
+			'Notes/Greek Democracy.md',
+			'the root may reference the seed note'
+		);
+		eq(
+			model.nodes.get('Ancient Greece')!.source,
+			'Notes/Greek Democracy.md',
+			'a mapped child becomes a reference node'
+		);
+		eq(
+			model.nodes.get('Hallucinated note')!.source,
+			undefined,
+			'a source name that does not exist is dropped'
+		);
+		eq(model.nodes.get('New concept')!.source, undefined, 'unmapped children stay ordinary nodes');
+		eq(model.nodes.get('New concept')!.canExpand, true, 'unmapped children stay expandable');
+		eq(model.nodes.get('Ancient Greece')!.canExpand, false, 'reference nodes are leaves by default');
+
+		const noteBody = app.vault.files.get(model.nodes.get('Ancient Greece')!.file)!;
+		assert(
+			noteBody.includes('> Source note: [[Notes/Greek Democracy]]'),
+			'the reference note points at the original'
+		);
+		assert(
+			noteBody.includes('- [[Greek Democracy]]'),
+			'the source note is also listed in Connections'
+		);
+		assert(
+			app.vault.files.has('Notes/Greek Democracy.md'),
+			'the user’s own note is left untouched'
+		);
+
+		await store.deleteSubtree(model, 'Ancient Greece');
+		assert(
+			app.vault.files.has('Notes/Greek Democracy.md'),
+			'deleting a reference node never deletes the source note'
+		);
+		assert(
+			!app.vault.files.has('CogniTree/Democracy Notes/Ancient Greece.md'),
+			'it removes the pointer note it created'
 		);
 	}
 

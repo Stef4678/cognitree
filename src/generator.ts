@@ -6,9 +6,16 @@ import type { VaultIndexer } from './indexer';
 import { extractJSON, hashString, normalizeComplexity, normalizeKey, titleCase } from './parser';
 import {
 	buildConnectionPrompt,
+	buildDeepenPrompt,
 	buildDiscoveryPrompt,
 	buildExpansionPrompt,
+	buildReviewCardsPrompt,
+	buildVaultTreePrompt,
 } from './prompts';
+import { buildBranchDigest } from './ask';
+import { sanitizeDeepDive } from './notebody';
+import { addCards, type CardDraft } from './review';
+import type { SemanticIndex } from './embeddings';
 import type { ConceptStore } from './store';
 import type {
 	ChildConcept,
@@ -21,6 +28,7 @@ import type {
 	TreeNode,
 	TreeModel,
 } from './types';
+import type { VaultTreeCandidate } from './prompts';
 
 /**
  * Orchestrates the four prompt workflows:
@@ -40,7 +48,9 @@ export class ConceptGenerator {
 		private store: ConceptStore,
 		private indexer: VaultIndexer,
 		private getSettings: () => PluginSettings,
-		cache: ResponseCache
+		cache: ResponseCache,
+		/** Optional semantic index; when absent, matching stays lexical. */
+		private semantic?: SemanticIndex
 	) {
 		this.api = new ApiClient(getSettings());
 		this.cache = cache;
@@ -160,7 +170,7 @@ export class ConceptGenerator {
 		node: TreeNode,
 		onDelta?: (d: string) => void
 	): Promise<ConnectionResult | null> {
-		const candidates = this.indexer.search(node.name, 120).filter((c) => c !== node.name);
+		const candidates = await this.connectionCandidates(node);
 		const prompt = buildConnectionPrompt({ concept: node.name, candidates });
 		const raw = await this.runPrompt(
 			`conn|${hashString(candidates.join('|'))}`,
@@ -175,6 +185,29 @@ export class ConceptGenerator {
 			Boolean
 		);
 		return result;
+	}
+
+	/**
+	 * Candidate notes for the connection prompt: the lexical name index merged
+	 * with semantically similar notes from the embedding index. Falls back to
+	 * the lexical list whenever embeddings are off, empty or failing.
+	 */
+	private async connectionCandidates(node: TreeNode): Promise<string[]> {
+		const lexical = this.indexer.search(node.name, 120).filter((c) => c !== node.name);
+		const semantic = this.semantic;
+		if (!semantic?.enabled || semantic.size === 0) return lexical;
+		try {
+			const hits = await semantic.search(`${node.name} ${node.description || ''}`.trim(), 40);
+			const merged: string[] = [];
+			for (const hit of hits) {
+				if (hit.name && hit.name !== node.name && !merged.includes(hit.name)) merged.push(hit.name);
+			}
+			for (const name of lexical) if (!merged.includes(name)) merged.push(name);
+			return merged.slice(0, 120);
+		} catch (err) {
+			console.warn('CogniTree: semantic candidate search failed — using the lexical index', err);
+			return lexical;
+		}
 	}
 
 	// ---------------------------------------------------------------- 4. Batch
@@ -282,7 +315,252 @@ export class ConceptGenerator {
 		return { added, errors };
 	}
 
-	// ---------------------------------------------------------------- 5. Follow-up chat
+	// ---------------------------------------------------------------- 5. Deep dive
+
+	/** Sibling names of a node inside its tree (extra context for the prompt). */
+	private siblingNames(node: TreeNode, model: TreeModel): string[] {
+		const parent = node.parent ? model.nodes.get(node.parent) : null;
+		if (!parent) return [];
+		return parent.children.filter((c) => c !== node.name);
+	}
+
+	/** Generate the deep-dive Markdown for one node (cached like every prompt). */
+	async deepen(
+		node: TreeNode,
+		model: TreeModel,
+		opts: { instruction?: string; onDelta?: (d: string) => void } = {}
+	): Promise<string> {
+		const s = this.settings();
+		const digest = buildBranchDigest(model, node.name, s.askContextMaxNodes, s.askContextMaxChars);
+		const prompt = buildDeepenPrompt({
+			concept: node.name,
+			description: node.description,
+			domain: node.domain,
+			complexity: node.complexity,
+			parent: node.parent,
+			children: node.children,
+			siblings: this.siblingNames(node, model),
+			connections: node.connections.slice(0, 12),
+			digest: digest.text,
+			instruction: opts.instruction,
+		});
+		const raw = await this.runPrompt('deepen', prompt.system, prompt.user, opts.onDelta);
+		return sanitizeDeepDive(raw);
+	}
+
+	/**
+	 * Write deep dives across a subtree (BFS order, bounded concurrency).
+	 * `budget` caps how many notes are written in one run; nodes that already
+	 * have a deep dive are counted as skipped unless `refresh` is set.
+	 */
+	async deepenBatch(
+		model: TreeModel,
+		startName: string,
+		opts: {
+			budget: number;
+			refresh?: boolean;
+			onProgress?: ProgressCallback;
+			onDelta?: (d: string) => void;
+			signal?: AbortSignal;
+		}
+	): Promise<{ deepened: number; skipped: number; errors: string[] }> {
+		if (!model.nodes.has(startName)) {
+			throw new ApiError(`Node "${startName}" not found in tree "${model.root}".`);
+		}
+
+		// BFS the subtree so shallow, high-value nodes are written first.
+		const budget = Math.max(1, opts.budget);
+		const queue: string[] = [startName];
+		const seen = new Set<string>();
+		const targets: TreeNode[] = [];
+		let skipped = 0;
+		while (queue.length > 0) {
+			const name = queue.shift()!;
+			if (seen.has(name)) continue;
+			seen.add(name);
+			const node = model.nodes.get(name);
+			if (!node) continue;
+			if (!node.deepened || opts.refresh) {
+				if (targets.length < budget) targets.push(node);
+				else skipped++;
+			} else {
+				skipped++;
+			}
+			for (const c of node.children) if (!seen.has(c)) queue.push(c);
+		}
+
+		const errors: string[] = [];
+		let deepened = 0;
+		let done = 0;
+		this.progress(opts.onProgress, 0, targets.length, `Writing ${targets.length} deep dive(s)…`);
+		await this.runBounded(
+			targets,
+			3,
+			async (node) => {
+				try {
+					this.progress(opts.onProgress, done, targets.length, `Deep dive: "${node.name}"…`);
+					const md = await this.deepen(node, model, { onDelta: opts.onDelta });
+					if (!md) throw new ApiError('the model returned no content');
+					await this.store.setDeepDive(node, md);
+					deepened++;
+				} catch (err) {
+					errors.push(`${node.name}: ${(err as Error).message}`);
+				} finally {
+					done++;
+					this.progress(opts.onProgress, done, targets.length, `Deep dive: "${node.name}"`);
+				}
+			},
+			opts.signal
+		);
+		return { deepened, skipped, errors };
+	}
+
+	/** Run `worker` over `items` with at most `limit` calls in flight. */
+	private async runBounded<T>(
+		items: T[],
+		limit: number,
+		worker: (item: T) => Promise<void>,
+		signal?: AbortSignal
+	): Promise<void> {
+		let idx = 0;
+		const run = async () => {
+			while (idx < items.length && !signal?.aborted) {
+				const item = items[idx++];
+				await worker(item);
+			}
+		};
+		await Promise.all(Array.from({ length: Math.min(Math.max(1, limit), items.length) }, run));
+	}
+
+	// ---------------------------------------------------------------- 7. Review cards
+
+	/** Generate Q/A cards for one node (JSON prompt, validated and trimmed). */
+	async cards(node: TreeNode, model: TreeModel, count: number): Promise<CardDraft[]> {
+		const s = this.settings();
+		const digest = buildBranchDigest(model, node.name, s.askContextMaxNodes, s.askContextMaxChars);
+		const deepDive = await this.store.readDeepDive(node);
+		const context = [
+			digest.text,
+			deepDive ? `Note body (deep dive):\n${deepDive.slice(0, 3000)}` : '',
+		]
+			.filter(Boolean)
+			.join('\n\n');
+		const prompt = buildReviewCardsPrompt({
+			concept: node.name,
+			description: node.description,
+			context,
+			count,
+		});
+		const raw = await this.runPrompt('cards', prompt.system, prompt.user);
+		const parsed = this.parse<{ cards?: CardDraft[] }>(raw, 'review cards');
+		return (parsed.cards ?? [])
+			.filter((c) => c && String(c.question ?? '').trim() && String(c.answer ?? '').trim())
+			.map((c) => ({
+				question: String(c.question).trim(),
+				answer: String(c.answer).trim(),
+				kind: String(c.kind ?? 'recall').trim() || 'recall',
+			}))
+			.slice(0, Math.max(1, count));
+	}
+
+	/**
+	 * Generate cards across a subtree (BFS, bounded concurrency). The review
+	 * store is saved after every node, so an interrupted run keeps its work.
+	 */
+	async cardsBatch(
+		model: TreeModel,
+		startName: string,
+		opts: {
+			budget: number;
+			perNode: number;
+			refresh?: boolean;
+			onProgress?: ProgressCallback;
+		}
+	): Promise<{ added: number; skipped: number; nodes: number; errors: string[] }> {
+		if (!model.nodes.has(startName)) {
+			throw new ApiError(`Node "${startName}" not found in tree "${model.root}".`);
+		}
+		const data = await this.store.loadReview(model.root);
+		const withCards = new Set(Object.values(data.cards).map((c) => c.node));
+
+		const budget = Math.max(1, opts.budget);
+		const queue: string[] = [startName];
+		const seen = new Set<string>();
+		const targets: TreeNode[] = [];
+		while (queue.length > 0) {
+			const name = queue.shift()!;
+			if (seen.has(name)) continue;
+			seen.add(name);
+			const node = model.nodes.get(name);
+			if (!node) continue;
+			if (!withCards.has(name) || opts.refresh) {
+				if (targets.length < budget) targets.push(node);
+			}
+			for (const c of node.children) if (!seen.has(c)) queue.push(c);
+		}
+
+		const errors: string[] = [];
+		let added = 0;
+		let skipped = 0;
+		let nodes = 0;
+		let done = 0;
+		this.progress(opts.onProgress, 0, targets.length, `Writing cards for ${targets.length} node(s)…`);
+		await this.runBounded(targets, 3, async (node) => {
+			try {
+				this.progress(opts.onProgress, done, targets.length, `Cards: "${node.name}"…`);
+				const drafts = await this.cards(node, model, opts.perNode);
+				if (drafts.length > 0) {
+					const res = addCards(data, node.name, drafts, Date.now(), opts.refresh);
+					added += res.added;
+					skipped += res.skipped;
+					nodes++;
+					await this.store.saveReview(data);
+				}
+			} catch (err) {
+				errors.push(`${node.name}: ${(err as Error).message}`);
+			} finally {
+				done++;
+				this.progress(opts.onProgress, done, targets.length, `Cards: "${node.name}"`);
+			}
+		});
+		return { added, skipped, nodes, errors };
+	}
+
+	// ---------------------------------------------------------------- 8. Vault cartography
+
+	/**
+	 * Ask the model to arrange EXISTING vault notes into a hierarchy. The
+	 * `source` values it returns are validated by the caller against the real
+	 * note list, so a hallucinated name can never produce a broken reference.
+	 */
+	async vaultTree(opts: {
+		concept: string;
+		seed: string;
+		seedKind: 'note' | 'tag';
+		candidates: VaultTreeCandidate[];
+		instruction?: string;
+		onDelta?: (d: string) => void;
+	}): Promise<DiscoveryResult> {
+		const prompt = buildVaultTreePrompt({
+			concept: opts.concept,
+			seed: opts.seed,
+			seedKind: opts.seedKind,
+			candidates: opts.candidates,
+			instruction: opts.instruction,
+		});
+		const raw = await this.runPrompt('vault-tree', prompt.system, prompt.user, opts.onDelta);
+		const result = this.parse<DiscoveryResult>(raw, 'vault cartography');
+		result.concept = result.concept || opts.concept;
+		result.domains = (result.domains || []).filter((d) => d && d.name && d.children?.length);
+		if (result.domains.length === 0) {
+			throw new ApiError(
+				'The model did not return a usable hierarchy for these notes. Try another seed.'
+			);
+		}
+		return result;
+	}
+
+	// ---------------------------------------------------------------- 9. Follow-up chat
 
 	/**
 	 * Non-cached chat completion for the "Ask about this concept" flow.

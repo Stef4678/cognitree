@@ -394,6 +394,300 @@ import { buildFollowUpSystem } from '../src/prompts';
 	);
 }
 
+// --- notebody (managed regions) ------------------------------------------
+import {
+	DEEP_DIVE_HEADING,
+	DEEP_DIVE_MARKER,
+	extractDeepDive,
+	extractRegion,
+	sanitizeDeepDive,
+	stripFrontmatter,
+} from '../src/notebody';
+
+{
+	const body = [
+		'# Direct Democracy',
+		'',
+		'Citizens vote directly.',
+		'',
+		DEEP_DIVE_HEADING,
+		DEEP_DIVE_MARKER,
+		'### How it works',
+		'',
+		'- Initiative',
+		'- Referendum',
+		'',
+		'## Connections',
+		'- [[Referendums]]',
+	].join('\n');
+	const dd = extractDeepDive(body);
+	assert(dd.includes('### How it works') && dd.includes('- Referendum'), 'notebody: deep dive extracted');
+	assert(!dd.includes('## Connections'), 'notebody: region ends at the next H2');
+	assert(extractDeepDive('# X\n\nno region here') === '', 'notebody: no marker → empty');
+	assert(
+		extractDeepDive(body.replace('- Referendum', '- Referendum (hand edit)')).includes('hand edit'),
+		'notebody: hand edits inside the region survive extraction'
+	);
+	assert(extractRegion(body, '<!-- nope -->') === '', 'notebody: unknown marker → empty');
+
+	const cleaned = sanitizeDeepDive(
+		'---\nconcept: "X"\n---\n## Deep dive\n<!-- cognitree:deep-dive -->\n### A\n\ntext'
+	);
+	assert(!cleaned.includes('---'), 'sanitize: frontmatter stripped');
+	assert(!cleaned.includes('## Deep dive') && !cleaned.includes('cognitree:deep-dive'), 'sanitize: heading + marker stripped');
+	assert(cleaned.startsWith('### A'), 'sanitize: keeps the first real line');
+	assert(sanitizeDeepDive('# Title\n\n## Sub\n\ntext').startsWith('## Sub'), 'sanitize: drops a top-level H1');
+	assert(sanitizeDeepDive('# Title\n\n## Deep dive\n\ntext').startsWith('text'), 'sanitize: drops an echoed region heading');
+	assert(sanitizeDeepDive('') === '' && sanitizeDeepDive('   \n\n ') === '', 'sanitize: empty stays empty');
+	assert(sanitizeDeepDive('a\n\n\n\n\nb') === 'a\n\nb', 'sanitize: collapses blank runs');
+	const capped = sanitizeDeepDive('x'.repeat(20000));
+	assert(capped.length < 12200 && capped.endsWith('_(truncated)_'), 'sanitize: length is capped');
+	assert(stripFrontmatter('---\na: 1\n---\nbody') === 'body', 'stripFrontmatter');
+	assert(stripFrontmatter('no frontmatter') === 'no frontmatter', 'stripFrontmatter: no-op without a block');
+}
+
+// --- semantic index (pure helpers) ---------------------------------------
+import {
+	MAX_EMBEDDING_RECORDS,
+	cosine,
+	emptyStore,
+	pendingFiles,
+	pruneStore,
+	rankBySimilarity,
+	vectorText,
+} from '../src/embeddings';
+
+{
+	assert(Math.abs(cosine([1, 0], [1, 0]) - 1) < 1e-9, 'cosine: identical vectors → 1');
+	assert(Math.abs(cosine([1, 2, 3], [2, 4, 6]) - 1) < 1e-9, 'cosine: scale invariant');
+	assert(cosine([1, 0], [0, 1]) === 0, 'cosine: orthogonal → 0');
+	assert(cosine([1, 2], [1, 2, 3]) === 0, 'cosine: mismatched length → 0');
+	assert(cosine([], [1]) === 0, 'cosine: empty vector → 0');
+	assert(cosine([0, 0], [1, 1]) === 0, 'cosine: degenerate vector → 0');
+
+	const ranked = rankBySimilarity([1, 0], {
+		'a.md': { vector: [1, 0] },
+		'b.md': { vector: [0.9, 0.1] },
+		'c.md': { vector: [0, 1] },
+	}, 2);
+	assert(
+		ranked.length === 2 && ranked[0].key === 'a.md' && ranked[1].key === 'b.md',
+		'rankBySimilarity: best-first, limited'
+	);
+	assert(rankBySimilarity([1, 0], {}, 5).length === 0, 'rankBySimilarity: empty store → no hits');
+
+	const text = vectorText(
+		'Referendums',
+		['#politics', '#voting'],
+		'---\ntags: x\n---\n# Referendums\n\nA **direct** vote on a law.'
+	);
+	assert(text.startsWith('Referendums — #politics #voting —'), 'vectorText: name + tags come first');
+	assert(!text.includes('---') && !text.includes('**'), 'vectorText: frontmatter and markup stripped');
+
+	const files = [
+		{ path: 'a.md', stat: { mtime: 10 } },
+		{ path: 'b.md', stat: { mtime: 20 } },
+	];
+	const store = emptyStore();
+	store.model = 'm1';
+	store.records['a.md'] = { mtime: 10, name: 'a', vector: [1] };
+	assert(
+		pendingFiles(files, store, 'm1').map((f) => f.path).join(',') === 'b.md',
+		'pendingFiles: unchanged notes are skipped'
+	);
+	assert(pendingFiles(files, store, 'm2').length === 2, 'pendingFiles: a new model re-embeds everything');
+	store.records['b.md'] = { mtime: 5, name: 'b', vector: [1] };
+	assert(
+		pendingFiles(files, store, 'm1').map((f) => f.path).join(',') === 'b.md',
+		'pendingFiles: an edited note is re-embedded'
+	);
+
+	assert(pruneStore(store, new Set(['b.md'])) === 1, 'pruneStore: drops notes that no longer exist');
+	assert(!store.records['a.md'] && !!store.records['b.md'], 'pruneStore: keeps the live notes');
+
+	const big = emptyStore();
+	for (let i = 0; i < MAX_EMBEDDING_RECORDS + 5; i++) {
+		big.records[`f${i}.md`] = { mtime: i, name: `f${i}`, vector: [1] };
+	}
+	assert(
+		pruneStore(big, new Set(Object.keys(big.records))) === 5,
+		'pruneStore: cap drops the oldest records'
+	);
+	assert(
+		Object.keys(big.records).length === MAX_EMBEDDING_RECORDS,
+		'pruneStore: respects the record cap'
+	);
+}
+
+// --- review / spaced repetition (pure) -----------------------------------
+import {
+	DAY_MS,
+	GRADES,
+	RELEARN_MS,
+	addCards,
+	cardIdFor,
+	describeDue,
+	dueCardIds,
+	gradeCard,
+	newReviewData,
+	removeCard,
+	reviewStats,
+	type ReviewState,
+} from '../src/review';
+
+{
+	const now = 1_700_000_000_000;
+	const data = newReviewData('Democracy');
+	const drafts = [
+		{ question: 'What is a referendum?', answer: 'A direct vote.', kind: 'recall' },
+		{ question: 'Cloze: a ___ is a direct vote', answer: 'referendum' },
+		{ question: '   ', answer: 'dropped' },
+	];
+	const first = addCards(data, 'Referendums', drafts, now);
+	assert(first.added === 2 && first.skipped === 0, 'addCards: adds valid cards, drops empty ones');
+	const second = addCards(data, 'Referendums', drafts, now + 1000);
+	assert(second.added === 0 && second.skipped === 2, 'addCards: re-adding without refresh is a no-op');
+	assert(
+		cardIdFor('Democracy', 'Referendums', 'What is a referendum?') ===
+			cardIdFor('Democracy', 'Referendums', '  what is a REFERENDUM? '),
+		'cardIdFor: stable across whitespace/case'
+	);
+	assert(
+		cardIdFor('T1', 'N', 'Q') !== cardIdFor('T2', 'N', 'Q'),
+		'cardIdFor: distinct per tree'
+	);
+
+	const stats = reviewStats(data, now);
+	assert(stats.total === 2 && stats.fresh === 2 && stats.due === 2, 'reviewStats: new cards are due');
+
+	const id = Object.keys(data.cards)[0];
+	let state = gradeCard(undefined, 'good', id, now);
+	assert(
+		state.reps === 1 && state.intervalDays === 1 && state.due === now + DAY_MS,
+		'gradeCard: first good → 1 day'
+	);
+	state = gradeCard(state, 'good', id, state.due);
+	assert(state.intervalDays === 6, 'gradeCard: second good → 6 days');
+	const easeBefore = state.ease;
+	state = gradeCard(state, 'good', id, state.due);
+	assert(state.intervalDays === Math.round(6 * easeBefore), 'gradeCard: third good → interval × ease');
+
+	const failed = gradeCard(state, 'again', id, state.due);
+	assert(
+		failed.reps === 0 && failed.intervalDays === 0 && failed.lapses === 1,
+		'gradeCard: again resets the card'
+	);
+	assert(failed.due === state.due + RELEARN_MS, 'gradeCard: again returns in the same session');
+	assert(failed.ease < state.ease, 'gradeCard: again lowers ease');
+
+	const base: ReviewState = { cardId: id, due: now, intervalDays: 10, ease: 2.5, reps: 3, lapses: 0 };
+	const hard = gradeCard(base, 'hard', id, now);
+	const good = gradeCard(base, 'good', id, now);
+	const easy = gradeCard(base, 'easy', id, now);
+	assert(
+		hard.intervalDays < good.intervalDays && good.intervalDays < easy.intervalDays,
+		`gradeCard: hard < good < easy (${hard.intervalDays} < ${good.intervalDays} < ${easy.intervalDays})`
+	);
+	assert(easy.ease > base.ease && hard.ease < base.ease, 'gradeCard: ease moves with the grade');
+
+	const maxed = gradeCard({ ...base, intervalDays: 300, reps: 9, ease: 2.8 }, 'easy', id, 0);
+	assert(maxed.intervalDays <= 365, 'gradeCard: interval is capped at a year');
+	const floored = gradeCard({ ...base, ease: 1.3, reps: 2 }, 'again', id, 0);
+	assert(floored.ease >= 1.3, 'gradeCard: ease is floored');
+
+	// Due ordering, scope and limits.
+	const data2 = newReviewData('T');
+	addCards(data2, 'A', [{ question: 'qa', answer: 'a' }, { question: 'qb', answer: 'b' }], now);
+	const ids = Object.keys(data2.cards);
+	data2.states[ids[0]] = { cardId: ids[0], due: now - 10 * DAY_MS, intervalDays: 5, ease: 2.5, reps: 2, lapses: 0 };
+	data2.states[ids[1]] = { cardId: ids[1], due: now + 5 * DAY_MS, intervalDays: 5, ease: 2.5, reps: 2, lapses: 0 };
+	const due = dueCardIds(data2, now, 10);
+	assert(due.length === 1 && due[0] === ids[0], 'dueCardIds: only overdue cards are due');
+	assert(dueCardIds(data2, now, 10, new Set(['Other'])).length === 0, 'dueCardIds: scope filters by node');
+	assert(dueCardIds(data2, now, 10, new Set(['A'])).length === 1, 'dueCardIds: scope keeps its own node');
+	assert(dueCardIds(data2, now + 10 * DAY_MS, 10).length === 2, 'dueCardIds: future cards come due');
+	assert(dueCardIds(data2, now, 0).length === 0, 'dueCardIds: limit is honoured');
+	assert(reviewStats(data2, now, new Set(['Other'])).total === 0, 'reviewStats: scope-aware');
+
+	assert(removeCard(data2, ids[0]) && !data2.cards[ids[0]] && !data2.states[ids[0]], 'removeCard: drops card + schedule');
+	assert(!removeCard(data2, 'nope'), 'removeCard: unknown id → false');
+
+	assert(GRADES.length === 4 && GRADES[0] === 'again', 'GRADES order');
+	assert(describeDue(now + 3 * DAY_MS, now) === 'in 3 days', 'describeDue: days');
+	assert(describeDue(now - 1, now) === 'now', 'describeDue: overdue');
+	assert(describeDue(now + 60_000, now).includes('min'), 'describeDue: minutes');
+	assert(describeDue(now + 60 * DAY_MS, now).includes('month'), 'describeDue: months');
+}
+
+// --- vault graph (pure) ---------------------------------------------------
+import {
+	buildGraph,
+	neighborhood,
+	notesWithTag,
+	sourceMap,
+	toCandidates,
+	topTags,
+} from '../src/vaultGraph';
+
+{
+	const graph = buildGraph([
+		{ name: 'Alpha', path: 'Alpha.md', tags: ['#research'], links: ['Beta.md', 'Gamma.md'] },
+		{ name: 'Beta', path: 'Beta.md', tags: ['#research', '#methods'], links: ['Gamma.md'] },
+		{ name: 'Gamma', path: 'Gamma.md', tags: ['#methods'], links: [] },
+		{ name: 'Delta', path: 'Delta.md', tags: [], links: ['Gamma.md', 'missing.md'] },
+	]);
+	assert(graph[2].backlinks === 3, 'buildGraph: counts backlinks');
+	assert(graph[1].backlinks === 1, 'buildGraph: counts a single backlink');
+	assert(graph[3].backlinks === 0, 'buildGraph: unresolved links are not backlinks');
+	assert(graph[0].backlinks === 0, 'buildGraph: no links → no backlinks');
+
+	const near = neighborhood(graph, 'Alpha.md', 1, 10);
+	assert(
+		near.length === 2 && near[0].name === 'Gamma',
+		'neighborhood: one hop, most-linked first'
+	);
+	assert(
+		neighborhood(graph, 'Alpha.md', 2, 10).length === 3,
+		'neighborhood: two hops reach the wider graph'
+	);
+	assert(neighborhood(graph, 'Alpha.md', 2, 1).length === 1, 'neighborhood: limit honoured');
+	assert(
+		neighborhood(graph, 'Alpha.md', 2, 10).every((n) => n.path !== 'Alpha.md'),
+		'neighborhood: the seed is excluded'
+	);
+	assert(neighborhood(graph, 'Nope.md', 1, 10).length === 0, 'neighborhood: unknown seed → empty');
+
+	assert(
+		notesWithTag(graph, 'research', 10).map((n) => n.name).sort().join(',') === 'Alpha,Beta',
+		'notesWithTag: exact tag'
+	);
+	assert(notesWithTag(graph, '#research', 10).length === 2, 'notesWithTag: leading # tolerated');
+	assert(notesWithTag(graph, 'methods', 10).length === 2, 'notesWithTag: matches every carrier');
+	assert(notesWithTag(graph, '', 10).length === 0, 'notesWithTag: empty tag → none');
+
+	const tags = topTags(graph, 5);
+	assert(
+		tags.length === 2 && tags.every((t) => t.count === 2),
+		'topTags: frequency counts'
+	);
+	assert(
+		tags.map((t) => t.tag).sort().join(',') === '#methods,#research',
+		'topTags: vault tags, normalised'
+	);
+	assert(topTags(graph, 1).length === 1, 'topTags: limit honoured');
+
+	const sources = sourceMap(graph);
+	assert(
+		sources.get('alpha') === 'Alpha.md' && sources.get('gamma') === 'Gamma.md',
+		'sourceMap: normalized name → path'
+	);
+	const candidates = toCandidates(graph);
+	assert(
+		candidates.length === 4 && candidates[3].name === 'Delta' && candidates[3].backlinks === 0,
+		'toCandidates: name + tags + backlinks'
+	);
+}
+
 // --- report --------------------------------------------------------------
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} TEST(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);

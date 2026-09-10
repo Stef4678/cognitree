@@ -67,6 +67,17 @@ Your mission, when the user supplies a root concept, a target depth and a node b
 
 Reply with ONLY valid JSON. No markdown fences, no commentary.`;
 
+const DEEPEN_SYSTEM = `You are CogniTree Deep Dive, a rigorous explainer embedded in the user's Obsidian vault. The user grows a branching knowledge tree, one note per concept, and has asked you to give one of those notes real substance.
+
+Write a self-contained Markdown section about the concept, aimed at a curious non-specialist who has already read its one-line definition. Ground everything in the branch context you are given: use the exact names that appear there, and never imply that a note exists when it does not.
+
+Rules (follow strictly):
+1. Start directly with a "### " subheading or with prose. Never emit a top-level "#" heading (the note already has one), never YAML frontmatter, never a "## Deep dive" heading (the plugin adds it), and never a closing summary of what you just wrote.
+2. Cover, in this order, only the parts that genuinely apply: what it is and why it matters (2-3 sentences); how it works, its main variants or mechanisms; 2-4 concrete examples; what it is commonly confused with, stated precisely; live debates, limits or open questions; and 2-4 concepts worth exploring next.
+3. Use short paragraphs, bullet lists and **bold** key terms. Include one small Markdown table when the concept is comparative.
+4. Target 350-600 words. Density over padding: no filler, no "in conclusion", no repeating the definition verbatim.
+5. Plain Markdown only — no JSON, no code fences around the whole answer.`;
+
 export interface BuiltPrompt {
 	system: string;
 	user: string;
@@ -204,6 +215,46 @@ Output a JSON object with exactly this structure:
 	return { system: CONNECTION_SYSTEM, user };
 }
 
+/**
+ * 6. Deep Dive — fill one node's note with substance. Returns plain Markdown
+ * (not JSON): the result is written into the note's `## Deep dive` region.
+ */
+export function buildDeepenPrompt(opts: {
+	concept: string;
+	description?: string;
+	domain?: string;
+	complexity?: string;
+	parent?: string | null;
+	children?: string[];
+	siblings?: string[];
+	connections?: string[];
+	digest?: string;
+	instruction?: string;
+}): BuiltPrompt {
+	const { concept, description, domain, complexity, parent, children, siblings, connections, digest, instruction } =
+		opts;
+	const facts: string[] = [];
+	if (parent) facts.push(`- Parent concept: ${parent}`);
+	if (domain) facts.push(`- Domain: ${domain}`);
+	if (complexity) facts.push(`- Difficulty: ${complexity}`);
+	if (description) facts.push(`- One-line definition already shown on the note: ${description}`);
+	if (children?.length) facts.push(`- Children already in the tree: ${children.join('; ')}`);
+	if (siblings?.length) facts.push(`- Siblings in the tree: ${siblings.join('; ')}`);
+	if (connections?.length) facts.push(`- Notes this node already links to: ${connections.join('; ')}`);
+
+	const user = `Write the deep-dive section for the note "${concept}" in the user's Obsidian vault.
+
+What the tree already knows about it:
+${facts.join('\n') || '- (no extra metadata)'}
+
+${digest ? `Branch context (the only concepts you may treat as existing notes):\n===== branch context =====\n${digest}\n===== end branch context =====\n` : ''}${
+		instruction ? `\nThe user asked you to focus on: ${instruction}\n` : ''
+	}
+Remember: no frontmatter, no top-level "#" heading, no restating the tree structure. Return only the Markdown body of the section.`;
+
+	return { system: DEEPEN_SYSTEM, user };
+}
+
 /** 4. Batch Generation Prompt — complete subtree up to a depth. */
 export function buildBatchPrompt(opts: {
 	root: string;
@@ -236,3 +287,108 @@ Output a JSON object with exactly this structure:
 }
 
 export const COMPLEXITIES: Complexity[] = ['Beginner', 'Intermediate', 'Advanced'];
+
+const REVIEW_SYSTEM = `You are CogniTree Review, a spaced-repetition card writer embedded in the user's Obsidian vault. You turn one concept note into flashcards the user will actually be tested on.
+
+Rules (follow strictly):
+1. Every question must be answerable from what the note and the supplied context state — never from trivia the user could not have read.
+2. One fact per card. No yes/no questions, no "all of the above", no questions whose answer is a list of everything.
+3. Mix the kinds: "recall" (retrieve a definition, mechanism or example), "cloze" (a sentence with the key term replaced by ___ ), "application" (apply the idea to a concrete case).
+4. Answers are 1-3 sentences, at most 40 words, and must stand alone without the question.
+5. Vary the angle across cards: definition, mechanism, example, contrast, limit or misconception.
+6. Reply with ONLY valid JSON. No markdown fences, no commentary.`;
+
+const VAULT_TREE_SYSTEM = `You are CogniTree Cartographer. You organise knowledge structures that already exist: given a seed concept and a list of REAL notes from the user's Obsidian vault, you propose a branching tree that arranges those notes into a navigable hierarchy.
+
+Rules (follow strictly):
+1. Use the notes you were given. Do not invent note names, and do not use a name that is not in the list as a "source".
+2. Domains are perspectives or disciplines that genuinely organise the material (2-6 of them), each with 2-6 children.
+3. For each child: if one of the listed notes is a good fit for that slot, set "source" to that note's EXACT name from the list and keep the child "name" as a clear title for it. Otherwise set "source" to "" and the child becomes a normal new concept.
+4. A listed note may appear at most once in the tree. Prefer arranging most of the listed notes over leaving them out.
+5. Reply with ONLY valid JSON. No markdown fences, no commentary.`;
+
+/**
+ * 7. Review cards — turn one node into Q/A flashcards (JSON).
+ * `context` is an optional branch digest / deep-dive excerpt for grounding.
+ */
+export function buildReviewCardsPrompt(opts: {
+	concept: string;
+	description?: string;
+	context?: string;
+	count?: number;
+}): BuiltPrompt {
+	const { concept, description, context, count = 3 } = opts;
+	const user = `Write ${count} flashcards for the concept "${concept}"${description ? ` (${description})` : ''}.
+
+${context ? `Material to draw on:\n===== note context =====\n${context}\n===== end note context =====\n` : ''}
+Output a JSON object with exactly this structure:
+{
+  "concept": "${concept}",
+  "cards": [
+    {
+      "question": "A specific question answerable from the material above",
+      "answer": "A 1-3 sentence answer (max 40 words)",
+      "kind": "recall|cloze|application"
+    }
+  ]
+}`;
+	return { system: REVIEW_SYSTEM, user };
+}
+
+export interface VaultTreeCandidate {
+	name: string;
+	/** Tags from frontmatter and inline tags. */
+	tags?: string[];
+	/** Number of resolved links pointing at this note (rough centrality). */
+	backlinks?: number;
+}
+
+/**
+ * 8. Vault cartography — arrange EXISTING vault notes into a tree.
+ * The result mirrors the Discovery shape, with an optional `source` per child.
+ */
+export function buildVaultTreePrompt(opts: {
+	concept: string;
+	seed: string;
+	seedKind: 'note' | 'tag';
+	candidates: VaultTreeCandidate[];
+	instruction?: string;
+}): BuiltPrompt {
+	const { concept, seed, seedKind, candidates, instruction } = opts;
+	const list = candidates
+		.map((c) => {
+			const bits: string[] = [];
+			if (c.tags?.length) bits.push(`tags: ${c.tags.slice(0, 6).join(', ')}`);
+			if (c.backlinks) bits.push(`${c.backlinks} backlink(s)`);
+			return `- ${c.name}${bits.length ? ` (${bits.join('; ')})` : ''}`;
+		})
+		.join('\n');
+	const user = `Organise the user's existing notes into a knowledge tree.
+
+Seed: ${seedKind === 'tag' ? `the tag #${seed}` : `the note "${seed}"`} — the tree should be called "${concept}".
+${instruction ? `The user asked for: ${instruction}\n` : ''}
+Candidate notes from the vault (${candidates.length}):
+${list || '- (no candidate notes were found)'}
+
+Output a JSON object with exactly this structure:
+{
+  "concept": "${concept}",
+  "domains": [
+    {
+      "name": "Domain or perspective",
+      "description": "One sentence on what this grouping covers",
+      "children": [
+        {
+          "name": "Clear title for this slot",
+          "description": "1-2 sentences",
+          "source": "Exact note name from the list above, or an empty string",
+          "complexity": "Beginner|Intermediate|Advanced"
+        }
+      ]
+    }
+  ],
+  "total_nodes": <number of children>,
+  "suggested_starting_branch": "Domain - Child"
+}`;
+	return { system: VAULT_TREE_SYSTEM, user };
+}

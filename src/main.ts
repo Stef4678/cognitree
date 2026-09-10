@@ -1,5 +1,6 @@
 import { MarkdownView, Notice, Plugin } from 'obsidian';
 import { ResponseCache } from './cache';
+import { SemanticIndex } from './embeddings';
 import { ConceptGenerator } from './generator';
 import { VaultIndexer } from './indexer';
 import { CogniTreeSettingTab } from './settings';
@@ -23,6 +24,7 @@ export default class CogniTreePlugin extends Plugin {
 	indexer!: VaultIndexer;
 	generator!: ConceptGenerator;
 	cache!: ResponseCache;
+	semantic!: SemanticIndex;
 
 	/** Live reference to the open tree view (no instance stored on the plugin). */
 	get treeView(): ConceptTreeView | null {
@@ -46,12 +48,22 @@ export default class CogniTreePlugin extends Plugin {
 			() => this.settings
 		);
 		await this.cache.loadFromDisk();
+		// Embedding vectors live next to the plugin, not in the data file.
+		const pluginDir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+		this.semantic = new SemanticIndex(
+			this.app,
+			() => this.settings,
+			`${pluginDir}/embeddings.json`,
+			(model, texts) => this.generator.api.embed(model, texts)
+		);
+		await this.semantic.load();
 		this.generator = new ConceptGenerator(
 			this.app,
 			this.store,
 			this.indexer,
 			() => this.settings,
-			this.cache
+			this.cache,
+			this.semantic
 		);
 
 		// View — return the view directly; never store it on the plugin
@@ -97,6 +109,26 @@ export default class CogniTreePlugin extends Plugin {
 			id: 'reindex-vault-notes',
 			name: 'Reindex vault notes',
 			callback: () => void this.reindexNotes(),
+		});
+		this.addCommand({
+			id: 'reindex-semantic',
+			name: 'Build semantic index (embeddings)',
+			callback: () => void this.reindexSemantic(),
+		});
+		this.addCommand({
+			id: 'review-due-cards',
+			name: 'Review due cards',
+			checkCallback: (checking) => {
+				const view = this.treeView;
+				if (!view || !view.hasTree()) return false;
+				if (!checking) view.openReview();
+				return true;
+			},
+		});
+		this.addCommand({
+			id: 'grow-tree-from-vault',
+			name: 'Grow a tree from existing vault notes',
+			callback: () => void this.activateView().then(() => this.treeView?.openVaultTreeDialog()),
 		});
 		this.addCommand({
 			id: 'ask-about-selected',
@@ -166,6 +198,42 @@ export default class CogniTreePlugin extends Plugin {
 		this.indexer.rebuild();
 		new Notice(`Indexed ${this.indexer.noteCount} vault notes.`);
 		this.treeView?.refreshStats();
+	}
+
+	/**
+	 * Embed new/changed vault notes so connection matching and Ask grounding can
+	 * use semantic similarity. Incremental and budgeted — re-run to continue.
+	 */
+	async reindexSemantic(): Promise<number> {
+		if (!this.semantic.enabled) {
+			new Notice(
+				'Set an embedding model in CogniTree settings first (Semantic index).',
+				6000
+			);
+			return 0;
+		}
+		const notice = new Notice('Building the semantic index…', 0);
+		try {
+			const res = await this.semantic.indexNotes({
+				excludeFolder: this.settings.treeFolder,
+				budget: this.settings.embeddingMaxNotes,
+				onProgress: (p) => notice.setMessage(p.label),
+			});
+			notice.hide();
+			new Notice(
+				`Semantic index: ${res.embedded} note(s) embedded` +
+					(res.truncated ? ' (budget reached — run again to continue)' : '') +
+					(res.failed ? `, ${res.failed} failed` : '') +
+					`. ${this.semantic.size} vector(s) cached.`,
+				8000
+			);
+			this.treeView?.refreshStats();
+			return res.embedded;
+		} catch (err) {
+			notice.hide();
+			ConceptGenerator.notice(err);
+			return 0;
+		}
 	}
 
 	// ------------------------------------------------------------------ view

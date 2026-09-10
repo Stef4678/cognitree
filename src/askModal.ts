@@ -166,6 +166,8 @@ export class AskModal extends Modal {
 
 	private messages: ChatMessage[] = [];
 	private digest: BranchDigest = { text: '', nodeCount: 0, omitted: 0 };
+	/** Semantic vault neighbours appended to the grounding text. */
+	private relatedBlock = '';
 	private digestCacheKey = '';
 	private alive = true;
 	private busy = false;
@@ -277,7 +279,18 @@ export class AskModal extends Modal {
 	// ------------------------------------------------------------- grounding
 
 	private refreshDigest(): void {
-		const key = `${this.model.updatedAt}:${this.model.root}:${this.node.name}:${this.node.children.join('¦')}`;
+		void this.refreshGrounding();
+	}
+
+	/** The full grounding text: branch digest + semantic vault neighbours. */
+	private groundingText(): string {
+		return [this.digest.text, this.relatedBlock].filter(Boolean).join('\n\n');
+	}
+
+	private async refreshGrounding(): Promise<void> {
+		const key = `${this.model.updatedAt}:${this.model.root}:${this.node.name}:${this.node.children.join(
+			'¦'
+		)}:${this.plugin.semantic?.size ?? 0}`;
 		if (this.digestCacheKey === key) return;
 		const s = this.plugin.settings;
 		this.digest = buildBranchDigest(
@@ -287,22 +300,51 @@ export class AskModal extends Modal {
 			s.askContextMaxChars
 		);
 		this.digestCacheKey = key;
+		this.relatedBlock = await this.buildRelatedBlock();
+		const text = this.groundingText();
 		const pre = this.contextBodyEl.querySelector('.ct-ask-context-pre');
-		if (pre) pre.setText(this.digest.text || '(No branch context available.)');
+		if (pre) pre.setText(text || '(No branch context available.)');
 		this.contextBtnEl.setText(
-			this.digest.text
-				? `Show grounding context (${this.digest.nodeCount} node${this.digest.nodeCount === 1 ? '' : 's'}${
+			text
+				? `Show grounding context (${this.digest.nodeCount} node${
+						this.digest.nodeCount === 1 ? '' : 's'
+				  }${this.relatedBlock ? ' + related vault notes' : ''}${
 						this.digest.omitted > 0 ? `, ${this.digest.omitted} omitted` : ''
 				  })`
 				: 'Show grounding context'
 		);
 	}
 
-	private seedSystem(): void {
-		this.refreshDigest();
+	/**
+	 * Vault notes that are semantically close to this concept but live outside
+	 * the tree — extra grounding for the answer, labelled so the model never
+	 * pretends they are nodes.
+	 */
+	private async buildRelatedBlock(): Promise<string> {
+		const semantic = this.plugin.semantic;
+		if (!semantic?.enabled || !this.plugin.settings.askUseSemantic || semantic.size === 0) {
+			return '';
+		}
+		try {
+			const hits = await semantic.search(`${this.node.name} ${this.node.description}`.trim(), 12);
+			const inTree = new Set([...this.model.nodes.keys()].map(normalizeKey));
+			const fresh = hits.filter((h) => !inTree.has(normalizeKey(h.name)));
+			if (fresh.length === 0) return '';
+			return [
+				'Related notes elsewhere in the vault (semantic matches — NOT part of this tree, but real notes the user owns):',
+				...fresh.map((h) => `- ${h.name} (${Math.round(h.score * 100)}% similar)`),
+			].join('\n');
+		} catch (err) {
+			console.warn('CogniTree: semantic Ask context failed', err);
+			return '';
+		}
+	}
+
+	private async seedSystem(): Promise<void> {
+		await this.refreshGrounding();
 		const system: ChatMessage = {
 			role: 'system',
-			content: buildFollowUpSystem(this.digest.text, this.node.name),
+			content: buildFollowUpSystem(this.groundingText(), this.node.name),
 		};
 		if (this.messages[0]?.role === 'system') this.messages[0] = system;
 		else this.messages.unshift(system);
@@ -323,7 +365,7 @@ export class AskModal extends Modal {
 	private async ask(questionRaw: string): Promise<void> {
 		const question = questionRaw.trim();
 		if (!question || this.busy) return;
-		this.seedSystem();
+		await this.seedSystem();
 
 		this.pushUserBubble(question);
 		this.messages.push({ role: 'user', content: question });
@@ -523,7 +565,7 @@ export class AskModal extends Modal {
 				this.node = reloaded.nodes.get(this.node.name) ?? parent;
 				this.digestCacheKey = '';
 			}
-			this.seedSystem();
+			await this.seedSystem();
 			await this.plugin.treeView?.refreshAll();
 			this.hideAdopt();
 			const note = `Added ${created.length} new node${created.length === 1 ? '' : 's'} under "${parent.name}".`;

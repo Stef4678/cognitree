@@ -7,7 +7,8 @@ import {
 	type TextComponent,
 } from 'obsidian';
 import type CogniTreePlugin from './main';
-import { PROVIDERS, curatedModelsFor, providerFor } from './types';
+import { PROVIDERS, curatedEmbeddingModelFor, curatedModelsFor, providerFor } from './types';
+import { EMBED_BATCH_SIZE } from './embeddings';
 
 /**
  * Plugin settings per the spec:
@@ -67,6 +68,30 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 				items: [
 					def('Ask: context nodes', 'How many branch nodes are included in the grounding context when you ask a question about a concept (plus a character budget below). Default: 60.', (s) => this.buildAskContextNodesRow(s)),
 					def('Ask: context characters', 'Character budget for the grounding context of one question — protects small-context models from huge branches. Default: 10000.', (s) => this.buildAskContextCharsRow(s)),
+					def('Ask: semantic vault context', 'Also ground answers in semantically related notes elsewhere in the vault (needs the semantic index below). Default: on.', (s) => this.buildAskSemanticRow(s)),
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Semantic index',
+				items: [
+					def('Embedding model', 'Model id used for /embeddings on your endpoint. Leave empty to keep matching lexical (note names + tags only).', (s) => this.buildEmbeddingModelRow(s)),
+					def('Notes per run', 'How many vault notes one "Build semantic index" run may embed. Re-run to continue where it stopped. Default: 300.', (s) => this.buildEmbeddingBudgetRow(s)),
+					def('Index status', 'Cached note vectors and maintenance actions.', (s) => this.buildEmbeddingStatusRow(s)),
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Review (spaced repetition)',
+				items: [
+					def('Cards per node', 'How many flashcards are generated for one concept. Default: 3.', (s) => this.buildReviewCardsRow(s)),
+				],
+			},
+			{
+				type: 'group',
+				heading: 'Vault cartography',
+				items: [
+					def('Notes per run', 'How many existing vault notes are offered to the model when growing a tree from your vault. Default: 60.', (s) => this.buildVaultTreeNotesRow(s)),
 				],
 			},
 			{
@@ -218,6 +243,120 @@ export class CogniTreeSettingTab extends PluginSettingTab {
 					}
 				});
 			});
+	}
+
+	private buildAskSemanticRow(setting: Setting): void {
+		setting
+			.setName('Ask: semantic vault context')
+			.setDesc(
+				'Also ground answers in semantically related notes elsewhere in the vault (needs the semantic index below). Default: on.'
+			)
+			.addToggle((t) =>
+				t.setValue(this.plugin.settings.askUseSemantic).onChange(async (v) => {
+					this.plugin.settings.askUseSemantic = v;
+					await this.plugin.saveSettings();
+				})
+			);
+	}
+
+	private buildEmbeddingModelRow(setting: Setting): void {
+		setting
+			.setName('Embedding model')
+			.setDesc(
+				'Model id used for /embeddings on your endpoint. Leave empty to keep matching lexical (note names + tags only).'
+			)
+			.addText((t) =>
+				t
+					.setPlaceholder('text-embedding-3-small')
+					.setValue(this.plugin.settings.embeddingModel)
+					.onChange(async (v) => {
+						this.plugin.settings.embeddingModel = v.trim();
+						await this.plugin.saveSettings();
+					})
+			)
+			.addExtraButton((b) =>
+				b
+					.setIcon('wand-2')
+					.setTooltip('Use this provider’s known embeddings model')
+					.onClick(async () => {
+						const model = curatedEmbeddingModelFor(this.plugin.settings.modelEndpoint);
+						if (!model) {
+							new Notice(
+								'No known embeddings model for this endpoint — enter one manually.'
+							);
+							return;
+						}
+						this.plugin.settings.embeddingModel = model;
+						await this.plugin.saveSettings();
+						this.update();
+					})
+			);
+	}
+
+	private buildEmbeddingBudgetRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Notes per run',
+			'How many vault notes one "Build semantic index" run may embed. Re-run to continue where it stopped. Default: 300.',
+			'300',
+			10,
+			5000,
+			() => this.plugin.settings.embeddingMaxNotes,
+			(n) => (this.plugin.settings.embeddingMaxNotes = n)
+		);
+	}
+
+	private buildEmbeddingStatusRow(setting: Setting): void {
+		const index = this.plugin.semantic;
+		setting
+			.setName('Index status')
+			.setDesc(
+				index?.enabled
+					? `${index.size} note vector(s) cached for model "${index.model || '—'}". Building sends one embeddings request per ${EMBED_BATCH_SIZE} notes.`
+					: 'Add an embedding model above to enable semantic matching.'
+			)
+			.addButton((b) =>
+				b
+					.setButtonText('Build index')
+					.setCta()
+					.onClick(async () => {
+						await this.plugin.reindexSemantic();
+						this.update();
+					})
+			)
+			.addButton((b) =>
+				b.setButtonText('Clear').onClick(async () => {
+					await this.plugin.semantic?.clear();
+					new Notice('Semantic index cleared.');
+					this.update();
+				})
+			);
+	}
+
+	private buildReviewCardsRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Cards per node',
+			'How many flashcards are generated for one concept. Default: 3.',
+			'3',
+			1,
+			10,
+			() => this.plugin.settings.reviewCardsPerNode,
+			(n) => (this.plugin.settings.reviewCardsPerNode = n)
+		);
+	}
+
+	private buildVaultTreeNotesRow(setting: Setting): void {
+		this.buildNumberRow(
+			setting,
+			'Notes per run',
+			'How many existing vault notes are offered to the model when growing a tree from your vault. Default: 60.',
+			'60',
+			5,
+			400,
+			() => this.plugin.settings.vaultTreeMaxNotes,
+			(n) => (this.plugin.settings.vaultTreeMaxNotes = n)
+		);
 	}
 
 	private buildTemperatureRow(setting: Setting): void {

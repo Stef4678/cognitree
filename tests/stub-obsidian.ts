@@ -48,6 +48,17 @@ export class FakeVault {
 
 	adapter = {
 		exists: async (p: string) => this.folders.has(p) || this.files.has(p),
+		read: async (p: string): Promise<string> => {
+			const value = this.files.get(p);
+			if (value === undefined) throw new Error(`File not found: ${p}`);
+			return value;
+		},
+		write: async (p: string, content: string): Promise<void> => {
+			this.files.set(p, content);
+		},
+		remove: async (p: string): Promise<void> => {
+			this.files.delete(p);
+		},
 		list: async (p: string) => {
 			const prefix = p ? p + '/' : '';
 			const files: string[] = [];

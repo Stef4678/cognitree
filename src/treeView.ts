@@ -7,14 +7,34 @@ import {
 	Setting,
 	TFile,
 	WorkspaceLeaf,
+	type TextComponent,
 } from 'obsidian';
 import type { ConnectionResult, TreeNode, TreeModel } from './types';
 import { PROVIDERS, curatedModelsFor, providerFor } from './types';
-import { normalizeKey } from './parser';
+import { normalizeKey, titleCase } from './parser';
 import { ApiError } from './api';
 import type CogniTreePlugin from './main';
 import { buildJsonSnapshot, buildOutline, buildTreeSvg, computeDepths } from './exporters';
 import { AskModal } from './askModal';
+import {
+	GRADES,
+	type Grade,
+	type ReviewData,
+	addCards,
+	dueCardIds,
+	gradeCard,
+	removeCard,
+	reviewStats,
+} from './review';
+import {
+	collectVaultNotes,
+	neighborhood,
+	notesWithTag,
+	sourceMap,
+	toCandidates,
+	topTags,
+	type GraphNote,
+} from './vaultGraph';
 
 export const VIEW_TYPE = 'cognitree-view';
 
@@ -44,6 +64,8 @@ export class ConceptTreeView extends ItemView {
 	private jumpToFirstMatch = false;
 	/** True while a generate/batch/connection action is running (re-entrancy guard). */
 	private actionInFlight = false;
+	/** Review cards due in the open tree (chipped in the stats row). */
+	private dueCount = 0;
 
 	private tooltipEl!: HTMLElement;
 	private noMatchEl!: HTMLElement;
@@ -249,6 +271,12 @@ export class ConceptTreeView extends ItemView {
 			attr: { title: 'Re-index vault note names for "Find connections"' },
 		});
 		reindexBtn.addEventListener('click', () => void this.plugin.reindexNotes());
+		const reviewBtn = toolbar.createEl('button', {
+			cls: 'ct-btn',
+			text: '🧠 Review',
+			attr: { title: 'Study the cards that are due in this tree' },
+		});
+		reviewBtn.addEventListener('click', () => this.openReview());
 		const refreshBtn = toolbar.createEl('button', {
 			cls: 'ct-btn',
 			text: '↻',
@@ -384,6 +412,7 @@ export class ConceptTreeView extends ItemView {
 		this.autoExpand(model);
 		this.render();
 		this.setStatus('');
+		void this.refreshDueCount();
 	}
 
 	/** Expand existing branches up to autoExpandDepth without API calls. */
@@ -666,6 +695,318 @@ export class ConceptTreeView extends ItemView {
 		}
 	}
 
+	// ------------------------------------------------------------- deep dive
+
+	/**
+	 * Write (or refresh) one node's deep dive. Regenerating replaces whatever is
+	 * in the note's `## Deep dive` region, so an existing one is only replaced
+	 * after the caller confirms (`refresh`).
+	 */
+	private async deepenNode(name: string, refresh = false): Promise<void> {
+		const node = this.model?.nodes.get(name);
+		if (!node || !this.model) return;
+		if (node.loading) return;
+		if (node.deepened && refresh) {
+			const ok = await confirmDialog(
+				this.app,
+				`Replace the existing deep dive of "${name}"? Hand edits inside it will be lost.`,
+				'Replace'
+			);
+			if (!ok) return;
+		}
+		if (!this.beginAction()) return;
+		node.loading = true;
+		this.setBusy(true, `Writing deep dive for "${name}"…`);
+		this.render();
+		try {
+			const md = await this.plugin.generator.deepen(node, this.model, {
+				onDelta: (d) =>
+					this.setBusy(true, `Writing deep dive for "${name}"… ${d.slice(-40)}`),
+			});
+			if (!md) throw new ApiError('The model returned no content for the deep dive.');
+			await this.plugin.store.setDeepDive(node, md);
+			new Notice(`Deep dive written for "${name}" (${md.length} chars).`, 4000);
+		} catch (err) {
+			this.handleError(err, `Deep dive for "${name}"`);
+		} finally {
+			node.loading = false;
+			this.setBusy(false);
+			this.endAction();
+			this.render();
+		}
+	}
+
+	/** Drop a node's generated deep dive from its note. */
+	private async removeDeepDive(name: string): Promise<void> {
+		const node = this.model?.nodes.get(name);
+		if (!node) return;
+		try {
+			await this.plugin.store.setDeepDive(node, null);
+			new Notice(`Deep dive removed from "${name}".`, 4000);
+			this.render();
+		} catch (err) {
+			this.handleError(err, `Removing the deep dive of "${name}"`);
+		}
+	}
+
+	/** Ask for a node budget, then write deep dives across the selected subtree. */
+	private deepenSubtreeDialog(): void {
+		if (!this.model) {
+			new Notice('Open a tree first.');
+			return;
+		}
+		const target = this.selected ?? this.model.root;
+		const node = this.model.nodes.get(target);
+		if (!node) return;
+		const subtree = this.plugin.store.collectSubtree(this.model, target);
+		const missing = subtree.filter((n) => !n.deepened).length;
+		const modal = new DeepenModal(
+			this.app,
+			{
+				nodeName: node.name,
+				subtreeSize: subtree.length,
+				missing,
+				budget: Math.min(Math.max(missing, 1), this.plugin.settings.maxNodesPerBatch),
+			},
+			(opts) => {
+				modal.close();
+				void this.runDeepenBatch(node.name, opts.budget, opts.refresh);
+			}
+		);
+		modal.open();
+	}
+
+	private async runDeepenBatch(name: string, budget: number, refresh: boolean): Promise<void> {
+		if (!this.model) return;
+		if (!this.beginAction()) return;
+		this.setBusy(true, `Writing deep dives under "${name}"…`);
+		try {
+			const { deepened, skipped, errors } = await this.plugin.generator.deepenBatch(
+				this.model,
+				name,
+				{
+					budget,
+					refresh,
+					onProgress: (info) => {
+						this.setBusy(true, `${info.label} — ${info.done}/${info.total}`);
+						this.setProgress(info.done, info.total);
+					},
+					onDelta: (d) => this.setBusy(true, `Deep dive under "${name}"… ${d.slice(-40)}`),
+				}
+			);
+			new Notice(
+				`Deep dives: ${deepened} written` +
+					(skipped ? `, ${skipped} skipped` : '') +
+					(errors.length ? `, ${errors.length} failed` : '') +
+					'.',
+				6000
+			);
+			if (errors.length > 0) console.warn('CogniTree deep-dive errors:', errors);
+			this.render();
+		} catch (err) {
+			this.handleError(err, `Deep dives under "${name}"`);
+		} finally {
+			this.setBusy(false);
+			this.setProgress(0, 0);
+			this.endAction();
+			this.render();
+		}
+	}
+
+	// ------------------------------------------------------------- review (SRS)
+
+	/** Generate cards for one node and merge them into the tree's review store. */
+	private async generateCards(name: string): Promise<void> {
+		const node = this.model?.nodes.get(name);
+		if (!node || !this.model) return;
+		if (!this.beginAction()) return;
+		this.setBusy(true, `Writing review cards for "${name}"…`);
+		try {
+			const drafts = await this.plugin.generator.cards(
+				node,
+				this.model,
+				this.plugin.settings.reviewCardsPerNode
+			);
+			if (drafts.length === 0) throw new ApiError('The model returned no usable cards.');
+			const data = await this.plugin.store.loadReview(this.model.root);
+			const { added, skipped } = addCards(data, node.name, drafts, Date.now(), true);
+			await this.plugin.store.saveReview(data);
+			new Notice(
+				`Review cards for "${name}": +${added}` +
+					(skipped ? ` (${skipped} duplicate skipped)` : '') +
+					'.',
+				5000
+			);
+			await this.refreshDueCount();
+		} catch (err) {
+			this.handleError(err, `Review cards for "${name}"`);
+		} finally {
+			this.setBusy(false);
+			this.endAction();
+		}
+	}
+
+	/** Generate cards for every node of the selected subtree that has none. */
+	private async generateCardsSubtree(): Promise<void> {
+		if (!this.model) {
+			new Notice('Open a tree first.');
+			return;
+		}
+		const target = this.selected ?? this.model.root;
+		const subtree = this.plugin.store.collectSubtree(this.model, target);
+		const budget = Math.min(this.plugin.settings.maxNodesPerBatch, subtree.length);
+		const ok = await confirmDialog(
+			this.app,
+			`Generate review cards for up to ${budget} node(s) under "${target}"? One cached API call per node.`,
+			'Generate'
+		);
+		if (!ok) return;
+		if (!this.beginAction()) return;
+		this.setBusy(true, `Writing review cards under "${target}"…`);
+		try {
+			const res = await this.plugin.generator.cardsBatch(this.model, target, {
+				budget,
+				perNode: this.plugin.settings.reviewCardsPerNode,
+				onProgress: (info) => {
+					this.setBusy(true, `${info.label} — ${info.done}/${info.total}`);
+					this.setProgress(info.done, info.total);
+				},
+			});
+			new Notice(
+				`Review cards: +${res.added} across ${res.nodes} node(s)` +
+					(res.skipped ? `, ${res.skipped} skipped` : '') +
+					(res.errors.length ? `, ${res.errors.length} failed` : '') +
+					'.',
+				6000
+			);
+			if (res.errors.length > 0) console.warn('CogniTree card errors:', res.errors);
+			await this.refreshDueCount();
+		} catch (err) {
+			this.handleError(err, `Review cards under "${target}"`);
+		} finally {
+			this.setBusy(false);
+			this.setProgress(0, 0);
+			this.endAction();
+		}
+	}
+
+	/** Open a study session over the due cards of the open tree (or one subtree). */
+	openReview(scopeNode?: string): void {
+		if (!this.model) {
+			new Notice('Open a tree first.');
+			return;
+		}
+		void (async () => {
+			const model = this.model!;
+			const data = await this.plugin.store.loadReview(model.root);
+			const stats = reviewStats(data, Date.now());
+			if (stats.total === 0) {
+				new Notice(
+					'No review cards in this tree yet — right-click a node → "Create review cards".',
+					6000
+				);
+				return;
+			}
+			const scope = scopeNode
+				? new Set(this.plugin.store.collectSubtree(model, scopeNode).map((n) => n.name))
+				: undefined;
+			const scoped = reviewStats(data, Date.now(), scope);
+			if (scoped.due === 0) {
+				new Notice(
+					`Nothing due${scopeNode ? ` under "${scopeNode}"` : ''} — ${scoped.total} card(s) scheduled later.`,
+					5000
+				);
+				return;
+			}
+			new ReviewModal(this.app, this.plugin, model.root, data, scope, () => {
+				void this.refreshDueCount();
+			}).open();
+		})();
+	}
+
+	/** Keep the "due" chip in sync with the review store. */
+	private async refreshDueCount(): Promise<void> {
+		if (!this.model) {
+			this.dueCount = 0;
+			this.updateStats();
+			return;
+		}
+		try {
+			const data = await this.plugin.store.loadReview(this.model.root);
+			this.dueCount = reviewStats(data, Date.now()).due;
+		} catch {
+			this.dueCount = 0;
+		}
+		this.updateStats();
+	}
+
+	// ------------------------------------------------------------- vault cartography
+
+	/** Pick a seed (open note or one of the vault's tags) and grow a tree from it. */
+	openVaultTreeDialog(): void {
+		const graph = collectVaultNotes(this.app, { excludeFolder: this.plugin.settings.treeFolder });
+		if (graph.length === 0) {
+			new Notice('No vault notes found outside the tree folder.', 5000);
+			return;
+		}
+		const active = this.app.workspace.getActiveFile();
+		new VaultTreeModal(
+			this.app,
+			{
+				activeName: active?.basename ?? null,
+				activePath: active?.path ?? null,
+				tags: topTags(graph, 20),
+				maxNotes: this.plugin.settings.vaultTreeMaxNotes,
+			},
+			(choice) => void this.runVaultTree(choice, graph)
+		).open();
+	}
+
+	private async runVaultTree(choice: VaultTreeChoice, graph: GraphNote[]): Promise<void> {
+		if (!this.beginAction()) return;
+		const label = choice.seedKind === 'tag' ? `#${choice.seed}` : `"${choice.seed}"`;
+		this.setBusy(true, `Reading your vault around ${label}…`);
+		try {
+			const candidates =
+				choice.seedKind === 'tag'
+					? notesWithTag(graph, choice.seed, choice.maxNotes)
+					: neighborhood(graph, choice.seedPath ?? '', 2, choice.maxNotes + 1).filter(
+							(n) => n.path !== choice.seedPath
+					  );
+			if (candidates.length === 0) {
+				throw new ApiError(`No notes related to ${label} were found to organise.`);
+			}
+			this.setBusy(true, `Arranging ${candidates.length} of your notes…`);
+			const result = await this.plugin.generator.vaultTree({
+				concept: choice.concept,
+				seed: choice.seed,
+				seedKind: choice.seedKind,
+				candidates: toCandidates(candidates.slice(0, choice.maxNotes)),
+				onDelta: (d) => this.setBusy(true, `Arranging your notes… ${d.slice(-40)}`),
+			});
+			this.setBusy(true, `Writing the tree…`);
+			const { root, created, linked, skipped } = await this.plugin.store.createVaultTree(
+				result,
+				this.plugin.settings.treeFolder,
+				sourceMap(candidates),
+				choice.seedKind === 'note' ? choice.seedPath : undefined
+			);
+			await this.refreshTrees();
+			await this.openTree(root);
+			new Notice(
+				`Tree "${root}": ${created.length} node(s), ${linked} linked to your own notes` +
+					(skipped.length ? `, ${skipped.length} duplicates skipped` : '') +
+					'.',
+				8000
+			);
+		} catch (err) {
+			this.handleError(err, 'Growing a tree from your vault');
+		} finally {
+			this.setBusy(false);
+			this.endAction();
+		}
+	}
+
 	// ------------------------------------------------------------- selection & menu
 
 	private select(name: string): void {
@@ -720,6 +1061,46 @@ export class ConceptTreeView extends ItemView {
 		menu.addSeparator();
 		menu.addItem((item) =>
 			item
+				.setTitle(node.deepened ? 'Refresh deep dive' : 'Write deep dive')
+				.setIcon('book-open')
+				.onClick(() => void this.deepenNode(name, true))
+		);
+		if (node.deepened) {
+			menu.addItem((item) =>
+				item
+					.setTitle('Remove deep dive')
+					.setIcon('eraser')
+					.onClick(() => void this.removeDeepDive(name))
+			);
+		}
+		menu.addItem((item) =>
+			item
+				.setTitle('Deep dive subtree…')
+				.setIcon('layers')
+				.onClick(() => this.deepenSubtreeDialog())
+		);
+		menu.addSeparator();
+		menu.addItem((item) =>
+			item
+				.setTitle('Create review cards')
+				.setIcon('brain')
+				.onClick(() => void this.generateCards(name))
+		);
+		menu.addItem((item) =>
+			item
+				.setTitle('Create review cards for subtree')
+				.setIcon('layers')
+				.onClick(() => void this.generateCardsSubtree())
+		);
+		menu.addItem((item) =>
+			item
+				.setTitle('Review this subtree')
+				.setIcon('graduation-cap')
+				.onClick(() => this.openReview(name))
+		);
+		menu.addSeparator();
+		menu.addItem((item) =>
+			item
 				.setTitle('Copy [[link]]')
 				.setIcon('link')
 				.onClick(() => this.copyToClipboard(`[[${node.name}]]`, 'Link'))
@@ -732,7 +1113,7 @@ export class ConceptTreeView extends ItemView {
 		);
 		menu.addItem((item) =>
 			item
-				.setTitle('Open note')
+				.setTitle(node.source ? 'Open source note' : 'Open note')
 				.setIcon('book-open')
 				.onClick(() => void this.plugin.store.openNote(node))
 		);
@@ -757,6 +1138,12 @@ export class ConceptTreeView extends ItemView {
 		);
 		menu.addItem((item) =>
 			item
+				.setTitle('Grow a tree from your vault…')
+				.setIcon('git-branch-plus')
+				.onClick(() => this.openVaultTreeDialog())
+		);
+		menu.addItem((item) =>
+			item
 				.setTitle('Export tree…')
 				.setIcon('download')
 				.onClick(() => this.openExport())
@@ -769,10 +1156,15 @@ export class ConceptTreeView extends ItemView {
 		const node = this.model.nodes.get(name);
 		if (!node) return;
 		const parentName = node.parent;
-		const count = this.plugin.store.collectSubtree(this.model, name).length;
+		const subtreeNodes = this.plugin.store.collectSubtree(this.model, name);
+		const count = subtreeNodes.length;
+		const references = subtreeNodes.filter((n) => n.source).length;
 		new ConfirmModal(
 			this.app,
-			`Delete "${name}" and ${count - 1} descendant note${count > 2 ? 's' : ''} from the vault?`,
+			`Delete "${name}" and ${count - 1} descendant note${count > 2 ? 's' : ''} from the vault?` +
+				(references > 0
+					? ` ${references} of them only link to notes you own — those source notes are not touched.`
+					: ''),
 			async () => {
 				// Capture the subtree contents so the delete can be undone.
 				const snap: { name: string; file: string; content: string }[] = [];
@@ -956,9 +1348,12 @@ export class ConceptTreeView extends ItemView {
 			chip('depth', String(maxDepth));
 			chip(this.trees.length === 1 ? 'tree' : 'trees', String(this.trees.length));
 			chip('notes indexed', String(this.plugin.indexer.noteCount));
+			if (this.plugin.semantic?.enabled) chip('vectors', String(this.plugin.semantic.size));
+			if (this.dueCount > 0) chip('cards due', String(this.dueCount), true);
 		} else {
 			chip(this.trees.length === 1 ? 'tree' : 'trees', String(this.trees.length));
 			chip('notes indexed', String(this.plugin.indexer.noteCount));
+			if (this.plugin.semantic?.enabled) chip('vectors', String(this.plugin.semantic.size));
 		}
 	}
 
@@ -1058,6 +1453,20 @@ export class ConceptTreeView extends ItemView {
 			} else if (node.canExpand) {
 				row.createSpan({ cls: 'ct-badge ct-hint', text: '∞' , attr: { title: `Can expand ~${node.estimatedDepth} levels deeper` }});
 			}
+			if (node.deepened) {
+				row.createSpan({
+					cls: 'ct-badge ct-deep',
+					text: '💡',
+					attr: { title: 'Has a generated deep dive' },
+				});
+			}
+			if (node.source) {
+				row.createSpan({
+					cls: 'ct-badge ct-ref',
+					text: '🔗',
+					attr: { title: `Links to your note: ${node.source}` },
+				});
+			}
 			if (node.loading) {
 				row.createSpan({ cls: 'ct-spinner' });
 			}
@@ -1089,6 +1498,19 @@ export class ConceptTreeView extends ItemView {
 			bLink.addEventListener('click', (e) => {
 				e.stopPropagation();
 				void this.findConnections(name);
+			});
+			const bDeep = actions.createEl('button', {
+				cls: 'ct-btn',
+				text: '💡',
+				attr: {
+					title: node.deepened
+						? 'Refresh this note’s deep dive'
+						: 'Write a deep dive into this note',
+				},
+			});
+			bDeep.addEventListener('click', (e) => {
+				e.stopPropagation();
+				void this.deepenNode(name, !!node.deepened);
 			});
 			const bOpen = actions.createEl('button', {
 				cls: 'ct-btn',
@@ -1371,6 +1793,294 @@ export class ConceptTreeView extends ItemView {
 	}
 }
 
+interface VaultTreeOptions {
+	activeName: string | null;
+	activePath: string | null;
+	tags: { tag: string; count: number }[];
+	maxNotes: number;
+}
+
+interface VaultTreeChoice {
+	seedKind: 'note' | 'tag';
+	seed: string;
+	seedPath?: string;
+	concept: string;
+	maxNotes: number;
+}
+
+/** Seed picker for "Grow a tree from your vault". */
+class VaultTreeModal extends Modal {
+	private choice: { label: string; kind: 'note' | 'tag'; value: string; path?: string };
+	private concept: string;
+	private maxNotes: number;
+
+	constructor(app: App, private opts: VaultTreeOptions, private onSubmit: (c: VaultTreeChoice) => void) {
+		super(app);
+		this.maxNotes = opts.maxNotes;
+		this.choice = {
+			label: opts.activeName ?? '',
+			kind: 'note',
+			value: opts.activeName ?? '',
+			path: opts.activePath ?? undefined,
+		};
+		this.concept = this.conceptFor(this.choice);
+	}
+
+	private conceptFor(source: { kind: 'note' | 'tag'; value: string }): string {
+		return titleCase(source.value.replace(/[-_]+/g, ' '));
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl('h3', { text: 'Grow a tree from your vault' });
+		contentEl.createEl('p', {
+			cls: 'ct-modal-hint',
+			text: 'CogniTree reads note names, tags and links from the metadata cache — no note contents — and arranges them into a tree. Your existing notes are linked, never copied or modified.',
+		});
+
+		const sources: { label: string; kind: 'note' | 'tag'; value: string; path?: string }[] = [];
+		if (this.opts.activeName && this.opts.activePath) {
+			sources.push({
+				label: `Current note: ${this.opts.activeName}`,
+				kind: 'note',
+				value: this.opts.activeName,
+				path: this.opts.activePath,
+			});
+		}
+		for (const tag of this.opts.tags) {
+			sources.push({
+				label: `Tag ${tag.tag} — ${tag.count} note(s)`,
+				kind: 'tag',
+				value: tag.tag.replace(/^#/, ''),
+			});
+		}
+		if (sources.length === 0) {
+			contentEl.createEl('p', {
+				cls: 'ct-muted',
+				text: 'No seed available: open a note, or tag some notes in your vault first.',
+			});
+			return;
+		}
+		this.choice = sources[0];
+		this.concept = this.conceptFor(this.choice);
+
+		let conceptInput: TextComponent | null = null;
+		new Setting(contentEl)
+			.setName('Source')
+			.setDesc(
+				'A note grows a tree around its link neighbourhood; a tag grows one over the notes carrying it.'
+			)
+			.addDropdown((dd) => {
+				sources.forEach((source, i) => dd.addOption(String(i), source.label));
+				dd.setValue('0');
+				dd.onChange((value) => {
+					this.choice = sources[Number(value)] ?? sources[0];
+					this.concept = this.conceptFor(this.choice);
+					conceptInput?.setValue(this.concept);
+				});
+			});
+		new Setting(contentEl)
+			.setName('Tree name')
+			.setDesc('Name of the tree and of its folder.')
+			.addText((t) => {
+				conceptInput = t;
+				t.setValue(this.concept).onChange((v) => (this.concept = v));
+			});
+		new Setting(contentEl)
+			.setName('Notes to consider')
+			.setDesc('Upper bound on how many of your notes are offered to the model.')
+			.addText((t) =>
+				t.setValue(String(this.maxNotes)).onChange((v) => {
+					const n = parseInt(v, 10);
+					if (Number.isFinite(n) && n > 0) this.maxNotes = n;
+				})
+			);
+
+		const btnRow = contentEl.createDiv({ cls: 'ct-modal-buttons' });
+		const run = btnRow.createEl('button', { cls: 'mod-cta', text: 'Grow tree' });
+		run.addEventListener('click', () => {
+			this.onSubmit({
+				seedKind: this.choice.kind,
+				seed: this.choice.value,
+				seedPath: this.choice.path,
+				concept: this.concept.trim() || this.choice.value,
+				maxNotes: this.maxNotes,
+			});
+			this.close();
+		});
+		const cancel = btnRow.createEl('button', { text: 'Cancel' });
+		cancel.addEventListener('click', () => this.close());
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+	}
+}
+
+interface ReviewSessionStats {
+	again: number;
+	hard: number;
+	good: number;
+	easy: number;
+	reviewed: number;
+}
+
+/**
+ * Study session over a tree's due cards: question → reveal → grade, with
+ * keyboard shortcuts (Space reveals, 1-4 grade). Grades are written to the
+ * review store as they are given, so closing the modal never loses progress.
+ */
+class ReviewModal extends Modal {
+	private queue: string[] = [];
+	private index = 0;
+	private revealed = false;
+	private stats: ReviewSessionStats = { again: 0, hard: 0, good: 0, easy: 0, reviewed: 0 };
+
+	constructor(
+		app: App,
+		private plugin: CogniTreePlugin,
+		private treeName: string,
+		private data: ReviewData,
+		/** Node names the session is limited to (undefined = whole tree). */
+		private sessionScope?: Set<string>,
+		private onFinish?: () => void
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		this.modalEl.addClass('ct-review-modal');
+		this.queue = dueCardIds(this.data, Date.now(), 30, this.sessionScope);
+		this.contentEl.setAttribute('tabindex', '0');
+		this.contentEl.addEventListener('keydown', (e) => {
+			if (e.key === ' ') {
+				e.preventDefault();
+				if (!this.revealed) {
+					this.revealed = true;
+					this.render();
+				}
+				return;
+			}
+			if (this.revealed && ['1', '2', '3', '4'].includes(e.key)) {
+				e.preventDefault();
+				this.grade(GRADES[Number(e.key) - 1]);
+			}
+		});
+		this.render();
+	}
+
+	private render(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.addClass('ct-review');
+		if (this.index >= this.queue.length) {
+			this.renderDone();
+			return;
+		}
+		const card = this.data.cards[this.queue[this.index]];
+		if (!card) {
+			this.index++;
+			this.render();
+			return;
+		}
+		const stats = reviewStats(this.data, Date.now(), this.sessionScope);
+
+		const head = contentEl.createDiv({ cls: 'ct-review-head' });
+		head.createSpan({ cls: 'ct-review-progress', text: `${this.index + 1} / ${this.queue.length}` });
+		head.createSpan({ cls: 'ct-review-tree', text: `Tree “${this.treeName}”` });
+		head.createSpan({
+			cls: 'ct-muted',
+			text: `${stats.due} due · ${stats.fresh} new · ${stats.mature} mature · ${stats.total} total`,
+		});
+
+		contentEl.createDiv({ cls: 'ct-review-node', text: card.node });
+		const q = contentEl.createDiv({ cls: 'ct-review-question' });
+		q.createSpan({ cls: 'ct-review-kind', text: card.kind });
+		q.createSpan({ text: card.question });
+
+		if (!this.revealed) {
+			const show = contentEl.createEl('button', {
+				cls: 'ct-btn ct-btn-primary ct-review-show',
+				text: 'Show answer (Space)',
+			});
+			show.addEventListener('click', () => {
+				this.revealed = true;
+				this.render();
+			});
+		} else {
+			contentEl.createDiv({ cls: 'ct-review-answer', text: card.answer });
+			const row = contentEl.createDiv({ cls: 'ct-review-grades' });
+			GRADES.forEach((grade, i) => {
+				const b = row.createEl('button', {
+					cls: `ct-btn ct-grade ct-grade-${grade}`,
+					text: `${i + 1} · ${grade}`,
+				});
+				b.addEventListener('click', () => this.grade(grade));
+			});
+		}
+
+		const foot = contentEl.createDiv({ cls: 'ct-review-foot' });
+		const skip = foot.createEl('button', { cls: 'ct-btn', text: 'Skip' });
+		skip.addEventListener('click', () => {
+			this.index++;
+			this.revealed = false;
+			this.render();
+		});
+		const del = foot.createEl('button', { cls: 'ct-btn', text: 'Delete card' });
+		del.addEventListener('click', () => {
+			removeCard(this.data, card.id);
+			void this.plugin.store.saveReview(this.data);
+			this.queue.splice(this.index, 1);
+			this.revealed = false;
+			new Notice('Card deleted.', 3000);
+			this.render();
+		});
+		const stop = foot.createEl('button', { cls: 'ct-btn', text: 'End session' });
+		stop.addEventListener('click', () => this.close());
+
+		this.contentEl.focus();
+	}
+
+	private grade(grade: Grade): void {
+		const id = this.queue[this.index];
+		const card = this.data.cards[id];
+		if (!card) return;
+		this.data.states[id] = gradeCard(this.data.states[id], grade, id, Date.now());
+		this.stats[grade]++;
+		this.stats.reviewed++;
+		void this.plugin.store.saveReview(this.data);
+		this.index++;
+		this.revealed = false;
+		this.render();
+	}
+
+	private renderDone(): void {
+		const { contentEl } = this;
+		contentEl.createEl('h3', { text: 'Session complete' });
+		const s = this.stats;
+		contentEl.createDiv({
+			cls: 'ct-review-summary',
+			text:
+				s.reviewed === 0
+					? 'No cards reviewed.'
+					: `${s.reviewed} card(s): ${s.again} again · ${s.hard} hard · ${s.good} good · ${s.easy} easy`,
+		});
+		const stats = reviewStats(this.data, Date.now(), this.sessionScope);
+		contentEl.createDiv({
+			cls: 'ct-muted',
+			text: `${stats.due} still due · ${stats.fresh} new · ${stats.learning} learning · ${stats.mature} mature`,
+		});
+		const close = contentEl.createEl('button', { cls: 'ct-btn ct-btn-primary', text: 'Close' });
+		close.addEventListener('click', () => this.close());
+	}
+
+	onClose(): void {
+		this.contentEl.empty();
+		this.onFinish?.();
+	}
+}
+
 // ================================================================ modals
 
 interface BatchOptions {
@@ -1434,10 +2144,14 @@ class BatchModal extends Modal {
 }
 
 class ConfirmModal extends Modal {
+	private decided = false;
+
 	constructor(
 		app: App,
 		private message: string,
-		private onConfirm: () => void | Promise<void>
+		private onConfirm: () => void | Promise<void>,
+		private confirmText = 'Delete',
+		private onDecline?: () => void
 	) {
 		super(app);
 	}
@@ -1447,13 +2161,88 @@ class ConfirmModal extends Modal {
 		contentEl.empty();
 		contentEl.createEl('p', { text: this.message });
 		const btnRow = contentEl.createDiv({ cls: 'ct-modal-buttons' });
-		const yes = btnRow.createEl('button', { cls: 'mod-warning', text: 'Delete' });
+		const yes = btnRow.createEl('button', { cls: 'mod-warning', text: this.confirmText });
 		yes.addEventListener('click', () => {
+			this.decided = true;
 			this.close();
 			void this.onConfirm();
 		});
 		const no = btnRow.createEl('button', { text: 'Cancel' });
 		no.addEventListener('click', () => this.close());
+	}
+
+	onClose(): void {
+		if (!this.decided) this.onDecline?.();
+		this.contentEl.empty();
+	}
+}
+
+/** Yes/no dialog; resolves `true` only when the confirm button is pressed. */
+function confirmDialog(app: App, message: string, confirmText = 'OK'): Promise<boolean> {
+	return new Promise((resolve) => {
+		let settled = false;
+		const finish = (value: boolean) => {
+			if (settled) return;
+			settled = true;
+			resolve(value);
+		};
+		new ConfirmModal(
+			app,
+			message,
+			() => finish(true),
+			confirmText,
+			() => finish(false)
+		).open();
+	});
+}
+
+interface DeepenOptions {
+	nodeName: string;
+	subtreeSize: number;
+	missing: number;
+	budget: number;
+}
+
+/** Budget picker for "Deep dive subtree". */
+class DeepenModal extends Modal {
+	constructor(
+		app: App,
+		private opts: DeepenOptions,
+		private onSubmit: (o: { budget: number; refresh: boolean }) => void
+	) {
+		super(app);
+	}
+
+	onOpen(): void {
+		const { contentEl } = this;
+		contentEl.empty();
+		contentEl.createEl('h3', { text: `Deep dive "${this.opts.nodeName}"` });
+		contentEl.createEl('p', {
+			cls: 'ct-modal-hint',
+			text: `Subtree: ${this.opts.subtreeSize} note(s), ${this.opts.missing} without a deep dive. Each one costs a single API call and is cached.`,
+		});
+		let budget = this.opts.budget;
+		let refresh = false;
+
+		new Setting(contentEl)
+			.setName('Note budget')
+			.setDesc('Maximum number of notes to write in this run.')
+			.addText((t) =>
+				t.setValue(String(budget)).onChange((v) => {
+					const n = parseInt(v, 10);
+					if (Number.isFinite(n) && n > 0) budget = n;
+				})
+			);
+		new Setting(contentEl)
+			.setName('Refresh existing')
+			.setDesc('Also rewrite notes that already have a deep dive.')
+			.addToggle((t) => t.setValue(false).onChange((v) => (refresh = v)));
+
+		const btnRow = contentEl.createDiv({ cls: 'ct-modal-buttons' });
+		const run = btnRow.createEl('button', { cls: 'mod-cta', text: 'Start' });
+		run.addEventListener('click', () => this.onSubmit({ budget, refresh }));
+		const cancel = btnRow.createEl('button', { text: 'Cancel' });
+		cancel.addEventListener('click', () => this.close());
 	}
 
 	onClose(): void {

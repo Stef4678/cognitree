@@ -574,6 +574,20 @@ body.theme-light {
 	font-size: 9px;
 }
 
+.ct-deep {
+	font-size: 10px;
+	padding: 0 5px;
+	background: rgba(245, 196, 83, 0.16);
+	border: 1px solid rgba(245, 196, 83, 0.4);
+}
+
+.ct-ref {
+	font-size: 10px;
+	padding: 0 5px;
+	background: rgba(124, 108, 255, 0.14);
+	border: 1px solid rgba(124, 108, 255, 0.4);
+}
+
 .ct-spinner {
 	flex: 0 0 auto;
 	width: 12px;
@@ -769,6 +783,113 @@ body.theme-light {
 		animation: none;
 		transition: none;
 	}
+}
+
+/* ------------------------------ review session ------------------------------ */
+
+.ct-review-modal {
+	width: min(640px, 92vw);
+}
+
+.ct-review {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.ct-review-head {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	flex-wrap: wrap;
+	font-size: var(--font-ui-smaller);
+}
+
+.ct-review-progress {
+	font-weight: 700;
+	color: var(--text-normal);
+}
+
+.ct-review-tree {
+	color: var(--text-muted);
+}
+
+.ct-review-node {
+	font-size: var(--font-ui-smaller);
+	font-weight: 700;
+	color: var(--ct-accent);
+}
+
+.ct-review-question {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	padding: 14px;
+	border: 1px solid var(--ct-border);
+	border-radius: var(--ct-radius);
+	background: var(--ct-surface);
+	font-size: var(--font-ui-medium);
+	line-height: 1.5;
+}
+
+.ct-review-kind {
+	flex: 0 0 auto;
+	font-size: 9.5px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+	color: var(--text-faint);
+	border: 1px solid var(--ct-border);
+	border-radius: 999px;
+	padding: 1px 7px;
+}
+
+.ct-review-answer {
+	padding: 14px;
+	border-left: 3px solid var(--ct-accent);
+	background: color-mix(in srgb, var(--ct-accent) 9%, transparent);
+	border-radius: var(--ct-radius-xs);
+	line-height: 1.55;
+	white-space: pre-wrap;
+}
+
+.ct-review-show {
+	align-self: flex-start;
+}
+
+.ct-review-grades,
+.ct-review-foot {
+	display: flex;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.ct-review-foot {
+	justify-content: flex-end;
+	margin-top: 4px;
+}
+
+.ct-grade {
+	flex: 1 1 90px;
+}
+
+.ct-grade-again {
+	border-color: rgba(244, 113, 138, 0.5);
+}
+
+.ct-grade-hard {
+	border-color: rgba(245, 196, 83, 0.5);
+}
+
+.ct-grade-good {
+	border-color: rgba(45, 212, 167, 0.5);
+}
+
+.ct-grade-easy {
+	border-color: rgba(124, 108, 255, 0.5);
+}
+
+.ct-review-summary {
+	font-weight: 600;
 }
 
 /* ------------------------------ visibility utilities ------------------------------ */

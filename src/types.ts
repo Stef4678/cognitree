@@ -12,6 +12,8 @@ export interface ChildConcept {
 	complexity?: Complexity;
 	can_expand?: boolean;
 	estimated_depth?: number;
+	/** Existing vault note this child should point at (vault cartography). */
+	source?: string;
 }
 
 export interface DomainGroup {
@@ -84,6 +86,10 @@ export interface TreeNode {
 	created: number;
 	/** Vault path of the backing note. */
 	file: string;
+	/** Epoch ms when a generated deep dive was written (0 = none). */
+	deepened?: number;
+	/** Vault path of the note this node points at (0 = a normal generated note). */
+	source?: string;
 	/** Display name of the tree root this node belongs to. */
 	treeRoot: string;
 	// --- ephemeral UI state (not persisted) ---
@@ -135,6 +141,14 @@ export interface PluginSettings {
 	// Follow-up chat ("Ask about this concept")
 	askContextMaxNodes: number; // default: 60 — nodes included in the branch digest
 	askContextMaxChars: number; // default: 10000 — character budget for the digest
+	// Semantic index (embeddings)
+	embeddingModel: string; // '' disables semantic search entirely
+	embeddingMaxNotes: number; // default: 300 — notes embedded per index run
+	askUseSemantic: boolean; // default: true — add related vault notes to Ask context
+	// Review (spaced repetition)
+	reviewCardsPerNode: number; // default: 3 — cards generated per node
+	// Vault cartography (trees over existing notes)
+	vaultTreeMaxNotes: number; // default: 60 — notes offered to the model per run
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
@@ -154,6 +168,11 @@ export const DEFAULT_SETTINGS: PluginSettings = {
 	treeFolder: 'CogniTree',
 	askContextMaxNodes: 60,
 	askContextMaxChars: 10000,
+	embeddingModel: '',
+	embeddingMaxNotes: 300,
+	askUseSemantic: true,
+	reviewCardsPerNode: 3,
+	vaultTreeMaxNotes: 60,
 };
 
 /** Curated model suggestions shown in the pickers before the endpoint list loads. */
@@ -178,6 +197,8 @@ export interface ProviderDef {
 	models: string[];
 	/** Local providers (Ollama, LM Studio) don't need an API key. */
 	keyRequired?: boolean;
+	/** Known embeddings model, offered as the default for the semantic index. */
+	embeddingModel?: string;
 }
 
 export const PROVIDERS: ProviderDef[] = [
@@ -193,6 +214,7 @@ export const PROVIDERS: ProviderDef[] = [
 		name: 'OpenAI',
 		endpoint: 'https://api.openai.com/v1',
 		defaultModel: 'gpt-4o-mini',
+		embeddingModel: 'text-embedding-3-small',
 		models: [
 			'gpt-4o-mini',
 			'gpt-4o',
@@ -208,6 +230,7 @@ export const PROVIDERS: ProviderDef[] = [
 		name: 'OpenRouter',
 		endpoint: 'https://openrouter.ai/api/v1',
 		defaultModel: 'openai/gpt-4o-mini',
+		embeddingModel: 'openai/text-embedding-3-small',
 		models: [
 			'openai/gpt-4o-mini',
 			'openai/gpt-4o',
@@ -228,6 +251,7 @@ export const PROVIDERS: ProviderDef[] = [
 		name: 'Mistral',
 		endpoint: 'https://api.mistral.ai/v1',
 		defaultModel: 'mistral-small-latest',
+		embeddingModel: 'mistral-embed',
 		models: ['mistral-small-latest', 'mistral-medium-latest', 'mistral-large-latest', 'codestral-latest'],
 	},
 	{
@@ -288,6 +312,7 @@ export const PROVIDERS: ProviderDef[] = [
 		defaultModel: 'llama3.2',
 		models: ['llama3.2', 'llama3.1', 'qwen2.5', 'mistral', 'deepseek-r1'],
 		keyRequired: false,
+		embeddingModel: 'nomic-embed-text',
 	},
 	{
 		id: 'lmstudio',
@@ -345,4 +370,9 @@ export function providerFor(endpoint: string): ProviderDef | null {
 /** Curated model list for the current endpoint (provider preset or CORE_MODELS). */
 export function curatedModelsFor(endpoint: string): string[] {
 	return providerFor(endpoint)?.models ?? CORE_MODELS;
+}
+
+/** The provider's known embeddings model ('' when we don't know one). */
+export function curatedEmbeddingModelFor(endpoint: string): string {
+	return providerFor(endpoint)?.embeddingModel ?? '';
 }

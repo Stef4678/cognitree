@@ -100,6 +100,56 @@ export class ApiClient {
 		}
 	}
 
+	/** Normalize the configured endpoint into a full /embeddings URL. */
+	private embeddingsEndpoint(): string {
+		let base = (this.settings.modelEndpoint || '').trim().replace(/\/+$/, '');
+		if (!base) base = 'https://api.deepseek.com';
+		if (base.endsWith('/embeddings')) return base;
+		if (base.endsWith('/chat/completions')) {
+			base = base.slice(0, -'/chat/completions'.length);
+		}
+		return `${base}/embeddings`;
+	}
+
+	/**
+	 * OpenAI-compatible embeddings call: one vector per input, in input order.
+	 * Throws `ApiError` when the endpoint refuses the request so callers can
+	 * fall back to lexical matching.
+	 */
+	async embed(model: string, texts: string[]): Promise<number[][]> {
+		if (texts.length === 0) return [];
+		const apiKey = this.settings.apiKey.trim();
+		const provider = providerFor(this.settings.modelEndpoint);
+		const needsKey = provider?.keyRequired !== false;
+		if (!apiKey && needsKey) {
+			throw new ApiError('No API key configured for the embeddings request.');
+		}
+		const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+		if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+		const res = await this.requestWithTimeout({
+			url: this.embeddingsEndpoint(),
+			method: 'POST',
+			headers,
+			body: JSON.stringify({ model, input: texts }),
+			throw: false,
+		});
+		if (res.status >= 400) {
+			throw new ApiError(
+				`Embeddings request failed (${res.status}): ${String(res.text ?? '').slice(0, 300)}`,
+				res.status
+			);
+		}
+		const data = res.json as { data?: { embedding?: number[]; index?: number }[] };
+		const out: number[][] = texts.map(() => []);
+		for (const [i, item] of (data?.data ?? []).entries()) {
+			const target = typeof item?.index === 'number' ? item.index : i;
+			if (target >= 0 && target < out.length && Array.isArray(item?.embedding)) {
+				out[target] = item.embedding.map((n) => Number(n));
+			}
+		}
+		return out;
+	}
+
 	/**
 	 * Run a chat completion and return the full assistant text.
 	 * `requestUrl` cannot be aborted or streamed incrementally, so a watchdog

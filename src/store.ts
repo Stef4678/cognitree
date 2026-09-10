@@ -18,7 +18,23 @@ import {
 	yamlStr,
 	yamlStrArray,
 } from './parser';
+import {
+	DEEP_DIVE_HEADING,
+	DEEP_DIVE_MARKER,
+	extractDeepDive,
+	sanitizeDeepDive,
+} from './notebody';
 import { cachedFrontmatter } from './indexer';
+import { REVIEW_DATA_VERSION, newReviewData, type ReviewData } from './review';
+
+/** Options for `ConceptStore.writeNode`. */
+export interface WriteNodeOptions {
+	/**
+	 * Deep-dive Markdown to write (`null` removes the region). Omit to carry
+	 * over whatever the note already contains.
+	 */
+	deepDive?: string | null;
+}
 
 /**
  * Markdown storage layer.
@@ -151,6 +167,8 @@ export class ConceptStore {
 			path: fm.path ? String(fm.path) : `/${slugify(name)}`,
 			created: toInt(fm.created, 0),
 			file: filePath,
+			deepened: toInt(fm.deepened, 0),
+			source: fm.source ? String(fm.source) : undefined,
 			treeRoot,
 			expanded: false,
 			loading: false,
@@ -164,7 +182,7 @@ export class ConceptStore {
 	}
 
 	/** Build a note's full markdown content. */
-	noteContent(node: TreeNode): string {
+	noteContent(node: TreeNode, deepDive: string | null = null): string {
 		const lines: string[] = [];
 		lines.push('---');
 		lines.push(`concept: ${yamlStr(node.name)}`);
@@ -178,13 +196,26 @@ export class ConceptStore {
 		lines.push(`connections: ${yamlStrArray(node.connections)}`);
 		lines.push(`children: ${yamlStrArray(node.children)}`);
 		lines.push(`path: ${yamlStr(node.path)}`);
+		if (node.source) lines.push(`source: ${yamlStr(node.source)}`);
+		if (node.deepened) lines.push(`deepened: ${isoTime(node.deepened)}`);
 		lines.push(`created: ${node.created ? isoTime(node.created) : isoTime(Date.now())}`);
 		lines.push('---');
 		lines.push('');
 		lines.push(`# ${node.name}`);
 		lines.push('');
+		// A reference node points at a note the user already owns.
+		if (node.source) {
+			lines.push(`> Source note: [[${node.source.replace(/\.md$/, '')}]]`);
+			lines.push('');
+		}
 		lines.push(node.description || '_No description yet._');
 		lines.push('');
+		if (deepDive) {
+			lines.push(DEEP_DIVE_HEADING);
+			lines.push(DEEP_DIVE_MARKER);
+			lines.push(deepDive.trim());
+			lines.push('');
+		}
 		lines.push('## Connections');
 		if (node.connections.length > 0) {
 			for (const c of node.connections) lines.push(`- [[${c}]]`);
@@ -202,12 +233,24 @@ export class ConceptStore {
 		return lines.join('\n');
 	}
 
-	/** Write a node note (create or overwrite in place). */
-	async writeNode(node: TreeNode): Promise<string> {
+	/**
+	 * Write a node note (create or overwrite in place).
+	 *
+	 * The note body is rebuilt from the model, so the generated deep dive is
+	 * read back from the existing file and carried over — otherwise every
+	 * connection link or child expansion would silently delete it. Pass
+	 * `deepDive: null` to remove the region, or a string to replace it.
+	 */
+	async writeNode(node: TreeNode, opts: WriteNodeOptions = {}): Promise<string> {
 		let file = node.file;
 		if (!file) file = await this.resolveFileFor(node);
-		const content = this.noteContent(node);
 		const existing = this.app.vault.getAbstractFileByPath(file);
+		let deepDive = opts.deepDive;
+		if (deepDive === undefined && existing instanceof TFile) {
+			deepDive = extractDeepDive(await this.app.vault.cachedRead(existing));
+		}
+		if (deepDive) node.deepened = node.deepened || Date.now();
+		const content = this.noteContent(node, deepDive ?? null);
 		if (existing instanceof TFile) {
 			await this.app.vault.modify(existing, content);
 		} else {
@@ -216,6 +259,24 @@ export class ConceptStore {
 		}
 		node.file = file;
 		return file;
+	}
+
+	/** The deep-dive Markdown currently stored in a node's note ('' when none). */
+	async readDeepDive(node: TreeNode): Promise<string> {
+		const file = this.app.vault.getAbstractFileByPath(node.file);
+		if (!(file instanceof TFile)) return '';
+		try {
+			return extractDeepDive(await this.app.vault.cachedRead(file));
+		} catch {
+			return '';
+		}
+	}
+
+	/** Store (or with `null` remove) a node's generated deep dive. */
+	async setDeepDive(node: TreeNode, markdown: string | null): Promise<void> {
+		const cleaned = markdown ? sanitizeDeepDive(markdown) : '';
+		node.deepened = cleaned ? Date.now() : 0;
+		await this.writeNode(node, { deepDive: cleaned });
 	}
 
 	private async ensureTreeFolder(node: TreeNode): Promise<void> {
@@ -325,6 +386,102 @@ export class ConceptStore {
 		return { root: rootName, created, skipped };
 	}
 
+	/**
+	 * Persist an LLM hierarchy over the user's EXISTING notes as a new tree.
+	 * Children the model mapped to a real note (validated against `sources`)
+	 * become reference nodes carrying `source: <vault path>`; everything else is
+	 * an ordinary generated node. Nothing in the vault is modified or copied —
+	 * the tree only links to the notes the user already owns.
+	 */
+	async createVaultTree(
+		result: DiscoveryResult,
+		baseFolder: string,
+		sources: Map<string, string>,
+		rootSource?: string
+	): Promise<{ root: string; created: TreeNode[]; linked: number; skipped: string[] }> {
+		this.setBaseFolder(baseFolder);
+		const rootName = titleTrim(result.concept || 'Concept');
+		await this.ensureBaseFolder();
+		const folder = this.treeFolder(rootName);
+		if (!(await this.app.vault.adapter.exists(folder))) {
+			await this.app.vault.createFolder(folder);
+		}
+
+		const now = Date.now();
+		const created: TreeNode[] = [];
+		const skipped: string[] = [];
+		const seen = new Set<string>([normalizeKey(rootName)]);
+		const rootPath = `/${slugify(rootName)}`;
+		let linked = 0;
+
+		const rootNode: TreeNode = {
+			name: rootName,
+			parent: null,
+			description: `Tree over existing vault notes, organised around ${rootName}.`,
+			complexity: 'Beginner',
+			canExpand: true,
+			estimatedDepth: 10,
+			connections: [],
+			children: [],
+			path: rootPath,
+			created: now,
+			file: '',
+			deepened: 0,
+			source: rootSource,
+			treeRoot: rootName,
+			expanded: false,
+			loading: false,
+		};
+
+		for (const domain of result.domains || []) {
+			const domainName = titleTrim(domain.name || 'Domain');
+			for (const child of domain.children || []) {
+				const childName = titleTrim(child.name || '');
+				if (!childName) continue;
+				const key = normalizeKey(childName);
+				if (seen.has(key)) {
+					skipped.push(childName);
+					continue;
+				}
+				seen.add(key);
+				// Only a name that exists in the candidate list may become a link.
+				const wanted = String(child.source ?? '').trim();
+				const sourcePath = wanted ? sources.get(normalizeKey(wanted)) : undefined;
+				if (sourcePath) linked++;
+				const node: TreeNode = {
+					name: childName,
+					parent: rootName,
+					domain: domainName,
+					description:
+						child.description ||
+						(sourcePath ? `Points at your note "${wanted}".` : ''),
+					complexity: normalizeComplexity(child.complexity),
+					canExpand: toBool(child.can_expand, !sourcePath),
+					estimatedDepth: toInt(child.estimated_depth, 4),
+					connections: sourcePath ? [wanted] : (child.connections || []).filter(Boolean),
+					children: [],
+					path: `${rootPath}/${slugify(domainName)}/${slugify(childName)}`,
+					created: now,
+					file: '',
+					deepened: 0,
+					source: sourcePath,
+					treeRoot: rootName,
+					expanded: false,
+					loading: false,
+				};
+				rootNode.children.push(childName);
+				created.push(node);
+			}
+		}
+
+		rootNode.file = await this.writeNode(rootNode);
+		for (const node of created) {
+			node.file = await this.writeNode(node);
+		}
+		await this.writeNode(rootNode); // final children list
+		return { root: rootName, created, linked, skipped };
+	}
+
 	/** Add children to an existing parent node; returns created + skipped names. */
 	async addChildren(
 		parent: TreeNode,
@@ -430,11 +587,14 @@ export class ConceptStore {
 				console.warn(`CogniTree: merged "${d.name}" as "${newFile}" (filename already in use).`);
 			}
 			const oldFile = d.file;
+			// Carry the generated deep dive across the move (the note body is
+			// rebuilt from the model, so it would otherwise be lost).
+			const deepDive = await this.readDeepDive(d);
 			d.treeRoot = targetNode.treeRoot;
 			d.parent = d.parent === node.name ? targetNode.name : d.parent;
 			d.path = `${targetNode.path}${rel}`;
 			d.file = newFile;
-			await this.app.vault.create(newFile, this.noteContent(d));
+			await this.app.vault.create(newFile, this.noteContent(d, deepDive || null));
 			const old = this.app.vault.getAbstractFileByPath(oldFile);
 			if (old instanceof TFile) await this.app.fileManager.trashFile(old);
 			moved.push(d);
@@ -544,12 +704,43 @@ export class ConceptStore {
 
 	/** Open the backing note in a new tab. */
 	async openNote(node: TreeNode): Promise<void> {
-		const file = this.app.vault.getAbstractFileByPath(node.file);
+		// A reference node points at the note the user already owns.
+		const target = node.source || node.file;
+		const file = this.app.vault.getAbstractFileByPath(target);
 		if (file instanceof TFile) {
 			await this.app.workspace.getLeaf(true).openFile(file);
 		} else {
-			new Notice(`Note not found: ${node.file}`);
+			new Notice(`Note not found: ${target}`);
 		}
+	}
+
+	// ---------------------------------------------------------------- review store
+
+	/** Hidden review store of a tree (cards + schedule); not a note. */
+	private reviewFile(rootName: string): string {
+		return `${this.treeFolder(rootName)}/.cognitree-review.json`;
+	}
+
+	async loadReview(rootName: string): Promise<ReviewData> {
+		try {
+			const raw = await this.app.vault.adapter.read(this.reviewFile(rootName));
+			const parsed = JSON.parse(raw) as ReviewData;
+			if (parsed && parsed.version === REVIEW_DATA_VERSION && parsed.cards && parsed.states) {
+				parsed.tree = rootName;
+				return parsed;
+			}
+		} catch {
+			/* no review store yet (or unreadable) */
+		}
+		return newReviewData(rootName);
+	}
+
+	async saveReview(data: ReviewData): Promise<void> {
+		const folder = this.treeFolder(data.tree);
+		if (!(await this.app.vault.adapter.exists(folder))) {
+			await this.app.vault.createFolder(folder);
+		}
+		await this.app.vault.adapter.write(this.reviewFile(data.tree), JSON.stringify(data, null, 1));
 	}
 
 	/** Write a brand-new note for a concept that doesn't exist yet (from connection suggestions). */
