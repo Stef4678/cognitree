@@ -154,10 +154,27 @@ export interface RadialOptions {
 	 * "Conser…" at the normal size.
 	 */
 	minLabelFontSize?: number;
+	/**
+	 * How far the rings may grow to keep names whole. The layout re-runs at
+	 * growing radii so that a wide, deep tree can label every node in full
+	 * instead of ellipsising the crowded rings. 1 disables the growth.
+	 */
+	radiusScaleLimit?: number;
 }
 
 /** Rough advance width per character for the label font stack (deliberately generous). */
 const CHAR_WIDTH_EM = 0.58;
+
+/**
+ * Slack demanded when deciding whether a label still needs more room. Without
+ * it the ring growth can stop exactly at the width where a name *just* fails to
+ * fit, leaving it cut.
+ */
+const LABEL_HEADROOM = 1.04;
+
+/** Font size and line advance of the footnote that lists unlabelled names. */
+const NOTE_FONT_SIZE = 11;
+const NOTE_LINE_HEIGHT = 15;
 
 export interface RadialArc {
 	name: string;
@@ -200,12 +217,20 @@ export interface RadialLabel {
 	arcLength: number;
 	/** True when the name had to be ellipsised to fit. */
 	shortened: boolean;
+	/**
+	 * True when characters were actually dropped, as opposed to the name merely
+	 * being capped at `maxLabelChars`. This is what the ring growth is driven by.
+	 */
+	truncated: boolean;
 	/** True when a single word was longer than a line and had to be split. */
 	hardBreak: boolean;
 }
 
 export interface RadialLayout {
+	/** Canvas width: a square that holds the circle. */
 	size: number;
+	/** Canvas height: `size`, plus the footnote strip when there is one. */
+	height: number;
 	cx: number;
 	cy: number;
 	centerRadius: number;
@@ -217,6 +242,12 @@ export interface RadialLayout {
 	rootLineHeight: number;
 	/** Nodes left unlabelled because their arc could not hold readable text. */
 	unlabelled: string[];
+	/**
+	 * The unlabelled names, wrapped ready to draw under the circle. An arc a few
+	 * pixels wide cannot hold text, but the node still has a name, so it is
+	 * listed instead of silently vanishing from the export.
+	 */
+	note: string[];
 }
 
 /**
@@ -229,269 +260,438 @@ export interface RadialLayout {
  */
 export function radialLayout(model: TreeModel, options: RadialOptions = {}): RadialLayout {
 	const { depth, weight, branch, maxDepth } = analyseTree(model);
-	const centerRadius = Math.max(24, options.centerRadius ?? 74);
-	const ringWidth = Math.max(20, options.ringWidth ?? 104);
+	const baseCenterRadius = Math.max(24, options.centerRadius ?? 74);
+	const baseRingWidth = Math.max(20, options.ringWidth ?? 104);
 	const maxLabelChars = Math.max(8, options.maxLabelChars ?? 64);
 	const maxLabelLines = Math.max(1, options.maxLabelLines ?? 3);
 	const gap = Math.max(0, options.gap ?? 0.008);
 	const baseFontSize = Math.max(6, options.labelFontSize ?? 10.5);
 	const minFontSize = Math.max(5, Math.min(baseFontSize, options.minLabelFontSize ?? 7.5));
-	const ringThickness = ringWidth - 4;
 	/** Font sizes to try, largest first (whole-pixel steps down to the floor). */
 	const fontSizes: number[] = [];
 	for (let size = baseFontSize; size >= minFontSize - 0.01; size -= 1) {
 		fontSizes.push(Number(size.toFixed(2)));
 	}
 
-	const outer = centerRadius + maxDepth * ringWidth + 26;
-	const size = Math.round(outer * 2 + 40);
-	const cx = size / 2;
-	const cy = size / 2 + 10;
+	/** Set by every pass to the ring growth its worst-fitting label still wants. */
+	let demand = 1;
 
-	/** Greedy word wrap; `hardBreak` is set when a word had to be split. */
-	const wrap = (
-		text: string,
-		perLine: number,
-		maxLines: number
-	): { lines: string[]; hardBreak: boolean } | null => {
-		if (perLine < 3) return null;
-		const words = text.split(/\s+/).filter(Boolean);
-		const lines: string[] = [];
-		let hardBreak = false;
-		let current = '';
-		const push = (line: string): boolean => {
-			if (lines.length >= maxLines) return false;
-			lines.push(line);
-			return true;
+	/**
+	 * One complete layout at one ring scale. The caller runs this repeatedly at
+	 * growing radii: a wider ring gives every label both a longer arc and more
+	 * characters per line, so a name that has to be cut at one scale can be
+	 * whole at the next.
+	 */
+	const runPass = (centerRadius: number, ringWidth: number): RadialLayout => {
+		const ringThickness = ringWidth - 4;
+		const outer = centerRadius + maxDepth * ringWidth + 26;
+		const size = Math.round(outer * 2 + 40);
+		const cx = size / 2;
+		const cy = size / 2 + 10;
+		demand = 1;
+
+		/** The name as it will be shown at most: long ones are capped with an ellipsis. */
+		const cappedName = (name: string): string =>
+			name.length > maxLabelChars ? `${name.slice(0, maxLabelChars - 1)}…` : name;
+
+		/**
+		 * Lines the greedy wrapper needs for `text` at `perLine`, with no cap — the
+		 * honest measure of a name's height. Counting characters instead would
+		 * under-report names whose words do not pack exactly ("Energy /
+		 * Transformation / Pathways" needs three lines even though it is short
+		 * enough for two by character count).
+		 */
+		const greedyLines = (text: string, perLine: number): number => {
+			const words = text.split(/\s+/).filter(Boolean);
+			let lines = 1;
+			let current = '';
+			for (const word of words) {
+				const candidate = current ? `${current} ${word}` : word;
+				if (candidate.length <= perLine) {
+					current = candidate;
+					continue;
+				}
+				if (current) lines += 1;
+				current = word;
+				while (current.length > perLine) {
+					current = current.slice(perLine);
+					lines += 1;
+				}
+			}
+			return Math.max(1, lines);
 		};
-		for (const word of words) {
-			const candidate = current ? `${current} ${word}` : word;
+
+		/** Greedy word wrap; `hardBreak` is set when a word had to be split. */
+		const wrap = (
+			text: string,
+			perLine: number,
+			maxLines: number
+		): { lines: string[]; hardBreak: boolean } | null => {
+			if (perLine < 3) return null;
+			const words = text.split(/\s+/).filter(Boolean);
+			const lines: string[] = [];
+			let hardBreak = false;
+			let current = '';
+			const push = (line: string): boolean => {
+				if (lines.length >= maxLines) return false;
+				lines.push(line);
+				return true;
+			};
+			for (const word of words) {
+				const candidate = current ? `${current} ${word}` : word;
+				if (candidate.length <= perLine) {
+					current = candidate;
+					continue;
+				}
+				if (current && !push(current)) return null;
+				current = '';
+				let rest = word;
+				while (rest.length > perLine) {
+					if (!push(rest.slice(0, perLine))) return null;
+					rest = rest.slice(perLine);
+					hardBreak = true;
+				}
+				current = rest;
+			}
+			if (current && !push(current)) return null;
+			return lines.length > 0 ? { lines, hardBreak } : null;
+		};
+
+		interface Fitted {
+			lines: string[];
+			orientation: 'tangential' | 'radial';
+			shortened: boolean;
+			/** True when the name was ellipsised to fit, rather than capped by length. */
+			truncated: boolean;
+			hardBreak: boolean;
+			/** Arc length available where the text sits (binding edge). */
+			arcLength: number;
+			fontSize: number;
+			lineHeight: number;
+		}
+
+		/** Layout options for one font size at one arc. */
+		const shapesAt = (span: number, innerRadius: number, midRadius: number, fontSize: number) => {
+			const charWidth = fontSize * CHAR_WIDTH_EM;
+			const lineHeight = fontSize * 1.25;
+			return [
+				{
+					orientation: 'tangential' as const,
+					perLine: Math.floor((span * midRadius - 6) / charWidth),
+					maxLines: Math.max(
+						1,
+						Math.min(maxLabelLines, Math.floor((ringThickness - 8) / lineHeight))
+					),
+					arcLength: span * midRadius,
+				},
+				{
+					orientation: 'radial' as const,
+					perLine: Math.floor((ringThickness - 12) / charWidth),
+					// Lines stack along the arc, so how many fit depends on the arc at the
+					// inner edge. Zero means a radial label cannot be placed without
+					// spilling over its neighbours, so this orientation is dropped.
+					maxLines: Math.min(maxLabelLines, Math.floor((span * innerRadius) / lineHeight)),
+					arcLength: span * innerRadius,
+				},
+			];
+		};
+
+		/**
+		 * Fit a name into an arc:
+		 *  1. the whole name at the largest font that can hold it without splitting a
+		 *     word, then at a smaller font that can, and only then allowing a word to
+		 *     be split (so "Mechanical / Energy / Conservation" wins over
+		 *     "Mechanical Ener / gy Conservation");
+		 *  2. failing all of that, as much of the name as the smallest font can show,
+		 *     ellipsised;
+		 *  3. failing that, no label (the arc still shows the node's size and colour).
+		 */
+		const fit = (name: string, span: number, innerRadius: number, midRadius: number): Fitted | null => {
+			const capped = cappedName(name);
+			const shortened = capped !== name;
+
+			for (const allowHardBreak of [false, true]) {
+				for (const fontSize of fontSizes) {
+					const lineHeight = fontSize * 1.25;
+					const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
+					for (const shape of shapes) {
+						if (shape.perLine < 4 || shape.maxLines < 1) continue;
+						const wrapped = wrap(capped, shape.perLine, shape.maxLines);
+						if (!wrapped) continue;
+						if (wrapped.hardBreak && !allowHardBreak) continue;
+						return {
+							lines: wrapped.lines,
+							orientation: shape.orientation,
+							shortened,
+							truncated: false,
+							hardBreak: wrapped.hardBreak,
+							arcLength: shape.arcLength,
+							fontSize,
+							lineHeight,
+						};
+					}
+				}
+			}
+
+			// Too small for the whole name even at the floor size: show as much as
+			// possible from the size with the most room.
+			for (const fontSize of [...fontSizes].reverse()) {
+				const lineHeight = fontSize * 1.25;
+				const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
+				const best = shapes
+					.slice()
+					.sort((a, b) => b.perLine * b.maxLines - a.perLine * a.maxLines)[0];
+				const capacity = best.perLine * best.maxLines;
+				if (best.perLine < 4 || capacity < 6) continue;
+				// Only signal a cut when characters really are dropped: dropping the
+				// tail of a name that fits whole would be a lie, and it would also
+				// keep the ring-growing pass asking for room it does not need.
+				const dropped = capacity - 1 < capped.length;
+				const text = dropped ? `${capped.slice(0, capacity - 1)}…` : capped;
+				const wrapped = wrap(text, best.perLine, best.maxLines);
+				if (!wrapped) continue;
+				return {
+					lines: wrapped.lines,
+					orientation: best.orientation,
+					shortened: shortened || dropped,
+					truncated: dropped,
+					hardBreak: wrapped.hardBreak,
+					arcLength: best.arcLength,
+					fontSize,
+					lineHeight,
+				};
+			}
+			return null;
+		};
+
+		/**
+		 * Angular width a name needs at the floor font, as a radial label — including
+		 * the padding that will be cut from both ends of its wedge. The line count
+		 * comes from the real word wrapper, because a name is only ever laid out on
+		 * word boundaries unless there is no other way.
+		 */
+		const neededSpan = (name: string, nodeDepth: number): number => {
+			const radius = Math.max(1, centerRadius + Math.max(0, nodeDepth - 1) * ringWidth + 6);
+			const perLine = Math.max(
+				1,
+				Math.floor((ringThickness - 12) / (minFontSize * CHAR_WIDTH_EM))
+			);
+			const lines = greedyLines(cappedName(name), perLine);
+			return (lines * minFontSize * 1.25) / radius + 2 * gap;
+		};
+
+		/**
+		 * How much wider this ring would have to be for the name to fit at the floor
+		 * font; 1 when the label is already as complete as the layout allows. This is
+		 * what tells the caller to grow the rings.
+		 */
+		const neededScale = (
+			name: string,
+			span: number,
+			radius: number,
+			fitted: Fitted | null
+		): number => {
+			if (span <= 0 || radius <= 0) return 1;
+			if (fitted && !fitted.truncated) return 1;
+			// The length cap is doing its job: no ring width can show a novel.
+			if (name.length > maxLabelChars) return 1;
+			const perLine = Math.max(
+				1,
+				Math.floor((ringThickness - 12) / (minFontSize * CHAR_WIDTH_EM))
+			);
+			const wanted = greedyLines(cappedName(name), perLine) * minFontSize * 1.25;
+			// A little headroom, so growth stops past the boundary rather than a
+			// hair short of it, which would leave the name cut.
+			return Math.max(1, (wanted * LABEL_HEADROOM) / (span * radius));
+		};
+
+		/**
+		 * Split `total` radians between siblings: each one gets the wedge its label
+		 * needs — never more than an equal share, so the floors can always be paid —
+		 * and whatever is left is divided by subtree weight. Without the minimum, a
+		 * one-leaf branch next to a thirty-leaf branch is a sliver, and
+		 * "Mechanical Energy Conservation" cannot be drawn in a sliver at any font
+		 * size; without the equal-share cap, many long names would collectively
+		 * overdraw the ring and shrink each other into illegibility.
+		 */
+		const splitSpans = (
+			kids: { name: string; depth: number; weight: number }[],
+			total: number
+		): number[] => {
+			if (kids.length === 0) return [];
+			const fair = total / kids.length;
+			const floors = kids.map((kid) => Math.min(neededSpan(kid.name, kid.depth), fair));
+			const floorTotal = floors.reduce((sum, value) => sum + value, 0);
+			const totalWeight = kids.reduce((sum, kid) => sum + kid.weight, 0) || 1;
+			const remaining = Math.max(0, total - floorTotal);
+			return kids.map((kid, i) => floors[i] + (remaining * kid.weight) / totalWeight);
+		};
+
+		const arcs: RadialArc[] = [];
+		const labels: RadialLabel[] = [];
+		const unlabelled: string[] = [];
+		// A node is drawn once even if hand-edited frontmatter lists it under two
+		// parents (or in a cycle) — without this the walk recurses forever.
+		const drawn = new Set<string>();
+		const walk = (name: string, from: number, to: number): void => {
+			if (drawn.has(name)) return;
+			drawn.add(name);
+			const node = model.nodes.get(name);
+			if (!node) return;
+			const nodeDepth = depth.get(name) ?? 0;
+			if (nodeDepth > 0) {
+				const inner = centerRadius + (nodeDepth - 1) * ringWidth;
+				const outerRadius = inner + ringWidth - 4;
+				// Padding must not dominate a narrow wedge.
+				const gapForArc = Math.min(gap, Math.max(0, to - from) * 0.1);
+				const arc: RadialArc = {
+					name,
+					depth: nodeDepth,
+					branch: branch.get(name) ?? 1,
+					inner,
+					outer: outerRadius,
+					from: from + gapForArc,
+					to: to - gapForArc,
+				};
+				arcs.push(arc);
+
+				const angle = (from + to) / 2;
+				const radius = inner + ringThickness / 2;
+				const span = Math.max(0, arc.to - arc.from);
+				const fitted = fit(node.name, span, inner + 6, radius);
+				demand = Math.max(demand, neededScale(node.name, span, inner + 6, fitted));
+				if (fitted) {
+					const longest = Math.max(...fitted.lines.map((line) => line.length));
+					const degrees = (angle * 180) / Math.PI;
+					const flipped = degrees > 90 && degrees < 270;
+					const [px, py] =
+						fitted.orientation === 'radial'
+							? flipped
+								? [cx + (outerRadius - 6) * Math.cos(angle), cy + (outerRadius - 6) * Math.sin(angle)]
+								: [cx + (inner + 6) * Math.cos(angle), cy + (inner + 6) * Math.sin(angle)]
+							: [cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)];
+					// Tangential footprint of the block, in px along the arc. For radial
+					// labels that is the stacked height, measured at the inner edge
+					// where the arc is narrowest.
+					const tangentialExtent =
+						fitted.orientation === 'radial'
+							? fitted.lines.length * fitted.lineHeight
+							: longest * fitted.fontSize * CHAR_WIDTH_EM;
+					const footprintRadius = fitted.orientation === 'radial' ? inner + 6 : radius;
+					labels.push({
+						name,
+						lines: fitted.lines,
+						text: fitted.lines.join(' '),
+						orientation: fitted.orientation,
+						angle,
+						radius,
+						x: px,
+						y: py,
+						rotation: flipped ? degrees + 180 : degrees,
+						anchor: fitted.orientation === 'radial' ? (flipped ? 'end' : 'start') : 'middle',
+						fontSize: fitted.fontSize,
+						lineHeight: fitted.lineHeight,
+						halfAngle: tangentialExtent / 2 / footprintRadius,
+						arcLength: fitted.arcLength,
+						shortened: fitted.shortened,
+						truncated: fitted.truncated,
+						hardBreak: fitted.hardBreak,
+					});
+				} else {
+					unlabelled.push(name);
+				}
+			}
+
+			const children = (node.children ?? []).filter((child) => model.nodes.has(child));
+			if (children.length === 0) return;
+			const childSpans = splitSpans(
+				children.map((child) => ({
+					name: child,
+					depth: nodeDepth + 1,
+					weight: weight.get(child) ?? 1,
+				})),
+				to - from
+			);
+			let cursor = from;
+			children.forEach((child, i) => {
+				walk(child, cursor, cursor + childSpans[i]);
+				cursor += childSpans[i];
+			});
+		};
+		// Walk each top-level branch across its slice of the full circle. Arcs never
+		// overlap between rings, so the order here is simply deterministic output.
+		const rootChildren = (model.nodes.get(model.root)?.children ?? []).filter((c) => model.nodes.has(c));
+		const rootSpans = splitSpans(
+			rootChildren.map((child) => ({ name: child, depth: 1, weight: weight.get(child) ?? 1 })),
+			Math.PI * 2
+		);
+		let cursor = 0;
+		rootChildren.forEach((child, i) => {
+			walk(child, cursor, cursor + rootSpans[i]);
+			cursor += rootSpans[i];
+		});
+
+		const rootName = model.nodes.get(model.root)?.name ?? model.root;
+		const rootFont = 13;
+		const rootLineHeight = rootFont * 1.25;
+		// The root label sits in a disc, so it wraps to the chord across it.
+		const rootLines =
+			wrap(rootName, Math.floor((2 * (centerRadius - 14)) / (rootFont * CHAR_WIDTH_EM)), 2)?.lines ?? [];
+
+		return {
+			size,
+			height: size,
+			cx,
+			cy,
+			centerRadius,
+			ringWidth,
+			arcs,
+			labels,
+			rootLines,
+			rootLineHeight,
+			unlabelled,
+			note: [],
+		};
+	};
+
+	// Grow the rings while any label still has to be cut, up to the scale limit.
+	// Every step re-runs the whole walk, because a wider ring fits more
+	// characters per line and so needs less angular room for the same name.
+	const maxScale = Math.max(1, options.radiusScaleLimit ?? 2.5);
+	let scale = 1;
+	let result = runPass(baseCenterRadius, baseRingWidth);
+	for (let step = 0; step < 6 && scale < maxScale && demand > 1.001; step++) {
+		scale = Math.min(maxScale, scale * Math.min(demand, 1.6));
+		result = runPass(baseCenterRadius * scale, baseRingWidth * scale);
+	}
+
+	// An arc a couple of pixels wide can never hold text, but the concept still
+	// has a name — list those under the drawing instead of losing them.
+	if (result.unlabelled.length > 0) {
+		const perLine = Math.max(
+			24,
+			Math.floor((result.size - 48) / (NOTE_FONT_SIZE * CHAR_WIDTH_EM))
+		);
+		const note: string[] = [
+			result.unlabelled.length === 1
+				? '1 concept is too narrow to label:'
+				: `${result.unlabelled.length} concepts are too narrow to label:`,
+		];
+		let current = '';
+		for (const name of result.unlabelled) {
+			const candidate = current ? `${current} · ${name}` : name;
 			if (candidate.length <= perLine) {
 				current = candidate;
 				continue;
 			}
-			if (current && !push(current)) return null;
-			current = '';
-			let rest = word;
-			while (rest.length > perLine) {
-				if (!push(rest.slice(0, perLine))) return null;
-				rest = rest.slice(perLine);
-				hardBreak = true;
-			}
-			current = rest;
+			if (current) note.push(current);
+			current = name;
 		}
-		if (current && !push(current)) return null;
-		return lines.length > 0 ? { lines, hardBreak } : null;
-	};
-
-	interface Fitted {
-		lines: string[];
-		orientation: 'tangential' | 'radial';
-		shortened: boolean;
-		hardBreak: boolean;
-		/** Arc length available where the text sits (binding edge). */
-		arcLength: number;
-		fontSize: number;
-		lineHeight: number;
+		if (current) note.push(current);
+		result.note = note;
+		result.height = result.size + note.length * NOTE_LINE_HEIGHT + 26;
 	}
-
-	/** Layout options for one font size at one arc. */
-	const shapesAt = (span: number, innerRadius: number, midRadius: number, fontSize: number) => {
-		const charWidth = fontSize * CHAR_WIDTH_EM;
-		const lineHeight = fontSize * 1.25;
-		return [
-			{
-				orientation: 'tangential' as const,
-				perLine: Math.floor((span * midRadius - 6) / charWidth),
-				maxLines: Math.max(
-					1,
-					Math.min(maxLabelLines, Math.floor((ringThickness - 8) / lineHeight))
-				),
-				arcLength: span * midRadius,
-			},
-			{
-				orientation: 'radial' as const,
-				perLine: Math.floor((ringThickness - 12) / charWidth),
-				// Lines stack along the arc, so how many fit depends on the arc at the
-				// inner edge. Zero means a radial label cannot be placed without
-				// spilling over its neighbours, so this orientation is dropped.
-				maxLines: Math.min(maxLabelLines, Math.floor((span * innerRadius) / lineHeight)),
-				arcLength: span * innerRadius,
-			},
-		];
-	};
-
-	/**
-	 * Fit a name into an arc:
-	 *  1. the whole name at the largest font that can hold it (so text shrinks
-	 *     before it is cut), preferring a clean word wrap over splitting a word,
-	 *     and tangential over radial;
-	 *  2. failing that, as much of the name as the smallest font can show,
-	 *     ellipsised;
-	 *  3. failing that, no label (the arc still shows the node's size and colour).
-	 */
-	const fit = (name: string, span: number, innerRadius: number, midRadius: number): Fitted | null => {
-		const capped = name.length > maxLabelChars ? `${name.slice(0, maxLabelChars - 1)}…` : name;
-		const shortened = capped !== name;
-
-		for (const fontSize of fontSizes) {
-			const lineHeight = fontSize * 1.25;
-			const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
-			for (const allowHardBreak of [false, true]) {
-				for (const shape of shapes) {
-					if (shape.perLine < 4 || shape.maxLines < 1) continue;
-					const wrapped = wrap(capped, shape.perLine, shape.maxLines);
-					if (!wrapped) continue;
-					if (wrapped.hardBreak && !allowHardBreak) continue;
-					return {
-						lines: wrapped.lines,
-						orientation: shape.orientation,
-						shortened,
-						hardBreak: wrapped.hardBreak,
-						arcLength: shape.arcLength,
-						fontSize,
-						lineHeight,
-					};
-				}
-			}
-		}
-
-		// Too small for the whole name even at the floor size: show as much as
-		// possible from the size with the most room.
-		for (const fontSize of [...fontSizes].reverse()) {
-			const lineHeight = fontSize * 1.25;
-			const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
-			const best = shapes
-				.slice()
-				.sort((a, b) => b.perLine * b.maxLines - a.perLine * a.maxLines)[0];
-			const capacity = best.perLine * best.maxLines;
-			if (best.perLine < 4 || capacity < 6) continue;
-			const wrapped = wrap(`${name.slice(0, capacity - 1)}…`, best.perLine, best.maxLines);
-			if (!wrapped) continue;
-			return {
-				lines: wrapped.lines,
-				orientation: best.orientation,
-				shortened: true,
-				hardBreak: wrapped.hardBreak,
-				arcLength: best.arcLength,
-				fontSize,
-				lineHeight,
-			};
-		}
-		return null;
-	};
-
-	const arcs: RadialArc[] = [];
-	const labels: RadialLabel[] = [];
-	const unlabelled: string[] = [];
-	// A node is drawn once even if hand-edited frontmatter lists it under two
-	// parents (or in a cycle) — without this the walk recurses forever.
-	const drawn = new Set<string>();
-	const walk = (name: string, from: number, to: number): void => {
-		if (drawn.has(name)) return;
-		drawn.add(name);
-		const node = model.nodes.get(name);
-		if (!node) return;
-		const nodeDepth = depth.get(name) ?? 0;
-		if (nodeDepth > 0) {
-			const inner = centerRadius + (nodeDepth - 1) * ringWidth;
-			const outerRadius = inner + ringWidth - 4;
-			const arc: RadialArc = {
-				name,
-				depth: nodeDepth,
-				branch: branch.get(name) ?? 1,
-				inner,
-				outer: outerRadius,
-				from: from + gap,
-				to: to - gap,
-			};
-			arcs.push(arc);
-
-			const angle = (from + to) / 2;
-			const radius = inner + ringThickness / 2;
-			const span = Math.max(0, arc.to - arc.from);
-			const fitted = fit(node.name, span, inner + 6, radius);
-			if (fitted) {
-				const longest = Math.max(...fitted.lines.map((line) => line.length));
-				const degrees = (angle * 180) / Math.PI;
-				const flipped = degrees > 90 && degrees < 270;
-				const [px, py] =
-					fitted.orientation === 'radial'
-						? flipped
-							? [cx + (outerRadius - 6) * Math.cos(angle), cy + (outerRadius - 6) * Math.sin(angle)]
-							: [cx + (inner + 6) * Math.cos(angle), cy + (inner + 6) * Math.sin(angle)]
-						: [cx + radius * Math.cos(angle), cy + radius * Math.sin(angle)];
-				// Tangential footprint of the block, in px along the arc. For radial
-				// labels that is the stacked height, measured at the inner edge
-				// where the arc is narrowest.
-				const tangentialExtent =
-					fitted.orientation === 'radial'
-						? fitted.lines.length * fitted.lineHeight
-						: longest * fitted.fontSize * CHAR_WIDTH_EM;
-				const footprintRadius = fitted.orientation === 'radial' ? inner + 6 : radius;
-				labels.push({
-					name,
-					lines: fitted.lines,
-					text: fitted.lines.join(' '),
-					orientation: fitted.orientation,
-					angle,
-					radius,
-					x: px,
-					y: py,
-					rotation: flipped ? degrees + 180 : degrees,
-					anchor: fitted.orientation === 'radial' ? (flipped ? 'end' : 'start') : 'middle',
-					fontSize: fitted.fontSize,
-					lineHeight: fitted.lineHeight,
-					halfAngle: tangentialExtent / 2 / footprintRadius,
-					arcLength: fitted.arcLength,
-					shortened: fitted.shortened,
-					hardBreak: fitted.hardBreak,
-				});
-			} else {
-				unlabelled.push(name);
-			}
-		}
-
-		const children = (node.children ?? []).filter((child) => model.nodes.has(child));
-		if (children.length === 0) return;
-		const total = children.reduce((sum, child) => sum + (weight.get(child) ?? 1), 0) || 1;
-		let cursor = from;
-		for (const child of children) {
-			const span = ((to - from) * (weight.get(child) ?? 1)) / total;
-			walk(child, cursor, cursor + span);
-			cursor += span;
-		}
-	};
-	// Walk each top-level branch across its slice of the full circle. Arcs never
-	// overlap between rings, so the order here is simply deterministic output.
-	const rootChildren = (model.nodes.get(model.root)?.children ?? []).filter((c) => model.nodes.has(c));
-	const rootWeight = rootChildren.reduce((sum, child) => sum + (weight.get(child) ?? 1), 0) || 1;
-	let cursor = 0;
-	for (const child of rootChildren) {
-		const span = (Math.PI * 2 * (weight.get(child) ?? 1)) / rootWeight;
-		walk(child, cursor, cursor + span);
-		cursor += span;
-	}
-
-	const rootName = model.nodes.get(model.root)?.name ?? model.root;
-	const rootFont = 13;
-	const rootLineHeight = rootFont * 1.25;
-	// The root label sits in a disc, so it wraps to the chord across it.
-	const rootLines =
-		wrap(rootName, Math.floor((2 * (centerRadius - 14)) / (rootFont * CHAR_WIDTH_EM)), 2)?.lines ?? [];
-
-	return {
-		size,
-		cx,
-		cy,
-		centerRadius,
-		ringWidth,
-		arcs,
-		labels,
-		rootLines,
-		rootLineHeight,
-		unlabelled,
-	};
+	return result;
 }
 
 /**
@@ -508,7 +708,7 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
  */
 export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): string {
 	const layout = radialLayout(model, options);
-	const { size, cx, cy, centerRadius, arcs, labels, rootLines, rootLineHeight } = layout;
+	const { size, height, cx, cy, centerRadius, arcs, labels, rootLines, rootLineHeight } = layout;
 	const round = (value: number): string => value.toFixed(2);
 	const point = (radius: number, angle: number): [number, number] => [
 		cx + radius * Math.cos(angle),
@@ -567,6 +767,14 @@ export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): s
 					.join('')}</text>`
 			: '';
 	const subtitleY = rootLines.length > 1 ? cy + 30 : cy + 15;
+	const noteMarkup = layout.note
+		.map(
+			(line, i) =>
+				`<text data-note="true" x="24" y="${round(size + 18 + i * NOTE_LINE_HEIGHT)}" font-size="${NOTE_FONT_SIZE}" fill="#6b6480">${escapeXml(
+					line
+				)}</text>`
+		)
+		.join('\n');
 	const body = `<title>${escapeXml(`${rootName} — ${model.nodes.size} concepts`)}</title>
 <rect width="100%" height="100%" fill="#ffffff"/>
 <circle data-node="${escapeXml(rootName)}" cx="${round(cx)}" cy="${round(cy)}" r="${round(
@@ -577,9 +785,10 @@ ${rootMarkup}
 		model.nodes.size
 	} concepts</text>
 ${arcMarkup}
-${labelMarkup}`;
+${labelMarkup}
+${noteMarkup}`;
 
-	return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${size}" viewBox="0 0 ${size} ${size}" font-family="Inter, system-ui, sans-serif">
+	return `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${height}" viewBox="0 0 ${size} ${height}" font-family="Inter, system-ui, sans-serif">
 ${body}
 </svg>
 `;

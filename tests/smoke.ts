@@ -746,7 +746,10 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		const width = Number(viewBox?.[1] ?? 0);
 		const height = Number(viewBox?.[2] ?? 0);
 		assert(
-			width > 0 && height > 0 && width === Number(svg.match(/width="(\d+)"/)?.[1]),
+			width > 0 &&
+				height > 0 &&
+				width === Number(svg.match(/width="(\d+)"/)?.[1]) &&
+				height === Number(svg.match(/height="(\d+)"/)?.[1]),
 			`${label}: viewBox matches the declared size`
 		);
 		const drawn = new Set([...svg.matchAll(/data-node="([^"]*)"/g)].map((m) => m[1]));
@@ -944,7 +947,9 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 			'sunburst: draws exactly the labels the layout kept'
 		);
 
-		// 40 tiny arcs: nothing readable fits, so those labels are dropped.
+		// 40 siblings in one ring: far too little angular room for these names at
+		// the base ring size, so the layout widens the rings until they fit. Every
+		// name ends up whole — the point of the growth.
 		const many = Array.from({ length: 40 }, (_, i) => `Sub concept number ${i + 1}`);
 		const crowded: TreeModel = {
 			root: 'Crowded',
@@ -956,22 +961,19 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 			]),
 		};
 		const crowdedLayout = radialLayout(crowded);
-		// 40 siblings leave ~19px of arc each. Nothing fits at full size, so the
-		// font shrinks to the floor — where the shorter names fit outright and the
-		// longer ones are only just cut.
 		eq(
 			crowdedLayout.labels.length,
 			many.length,
 			'radialLayout: a 40-way ring still labels every arc'
 		);
 		assert(
-			crowdedLayout.labels.every((label) => label.fontSize < 10.5),
-			'radialLayout: the font shrank to make room before cutting the name'
+			crowdedLayout.ringWidth > 104,
+			'radialLayout: a crowded ring is widened to make room'
 		);
-		assert(
-			crowdedLayout.labels.some((label) => label.shortened) &&
-				crowdedLayout.labels.some((label) => !label.shortened),
-			'radialLayout: reduced text keeps the shorter names complete'
+		eq(
+			crowdedLayout.labels.filter((label) => label.shortened).length,
+			0,
+			'radialLayout: a 40-way ring shows every name whole'
 		);
 		eq(
 			crowdedLayout.unlabelled.length,
@@ -980,6 +982,90 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		);
 		eq(countOverlaps(crowdedLayout), 0, 'radialLayout: crowded rings still do not overlap');
 		assertSvgSane('sunburst (crowded ring)', buildRadialSvg(crowded), crowded.nodes.size);
+
+		// With the growth switched off, the same ring has to fall back on the
+		// floor font and ellipsis. That path still has to work: it is what keeps a
+		// deliberately fixed-size export readable rather than empty.
+		const fixedLayout = radialLayout(crowded, { radiusScaleLimit: 1 });
+		eq(fixedLayout.ringWidth, 104, 'radialLayout: the growth limit is honoured');
+		eq(
+			fixedLayout.labels.length,
+			many.length,
+			'radialLayout: a fixed-size 40-way ring still labels every arc'
+		);
+		assert(
+			fixedLayout.labels.some((label) => label.truncated),
+			'radialLayout: without growth the crowded ring ellipsises its names'
+		);
+		assert(
+			fixedLayout.labels.every((label) => label.fontSize < 10.5),
+			'radialLayout: without growth the font shrinks to make room'
+		);
+		assertSvgSane(
+			'sunburst (fixed size crowded ring)',
+			buildRadialSvg(crowded, { radiusScaleLimit: 1 }),
+			crowded.nodes.size
+		);
+
+		// A hundred siblings in one ring: at the base size the arcs are a few
+		// pixels wide and can hold no text at all. Those names must still appear,
+		// so the layout lists them under the drawing rather than losing them.
+		const swarmNames = Array.from({ length: 100 }, (_, i) => `Concept ${i + 1}`);
+		const swarm: TreeModel = {
+			root: 'Swarm',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Swarm', node('Swarm', null, swarmNames)],
+				...swarmNames.map((name) => [name, node(name, 'Swarm')] as [string, TreeNode]),
+			]),
+		};
+		const swarmLayout = radialLayout(swarm, { radiusScaleLimit: 1 });
+		eq(
+			swarmLayout.unlabelled.length,
+			swarmNames.length,
+			'radialLayout: sub-pixel arcs are left unlabelled'
+		);
+		assert(
+			swarmLayout.note.length > 1,
+			'radialLayout: the unlabelled names are listed under the drawing'
+		);
+		assert(
+			swarmLayout.height > swarmLayout.size,
+			'radialLayout: the footnote extends the canvas'
+		);
+		const noteText = swarmLayout.note.join(' ');
+		const missingFromNote = swarmLayout.unlabelled.filter((name) => !noteText.includes(name));
+		eq(
+			missingFromNote.length,
+			0,
+			`radialLayout: every unlabelled name is in the footnote${
+				missingFromNote.length ? ` (missing ${missingFromNote.slice(0, 3).join(', ')})` : ''
+			}`
+		);
+		const swarmSvg = buildRadialSvg(swarm, { radiusScaleLimit: 1 });
+		assert(
+			swarmSvg.includes('too narrow to label'),
+			'sunburst: the footnote explains itself'
+		);
+		const missingFromSvg = swarmNames.filter((name) => !swarmSvg.includes(name));
+		eq(
+			missingFromSvg.length,
+			0,
+			`sunburst: every narrow name survives in the export${
+				missingFromSvg.length ? ` (missing ${missingFromSvg.slice(0, 3).join(', ')})` : ''
+			}`
+		);		assertSvgSane('sunburst (unlabelled swarm)', swarmSvg, swarm.nodes.size);
+
+		// Merely crowded, not hopeless: growing the rings labels the same ring.
+		const swarmGrown = radialLayout(swarm);
+		eq(
+			swarmGrown.unlabelled.length,
+			0,
+			'radialLayout: growth rescues a crowded ring rather than footnoting it'
+		);
+		eq(swarmGrown.note.length, 0, 'radialLayout: no footnote when nothing is unlabelled');
+		eq(swarmGrown.height, swarmGrown.size, 'radialLayout: a clean layout stays square');
 
 		// A 20-way ring cannot hold these names at full size, but it can at a
 		// smaller size — shrinking must be preferred over ellipsising.
@@ -1000,14 +1086,67 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 				(label) =>
 					label.lines.join(' ').replace(/\s+/g, '') === label.name.replace(/\s+/g, '')
 			),
-			'radialLayout: smaller text keeps those names complete'
-		);
-		assert(
-			reducedLayout.labels.some((label) => label.fontSize < 10.5),
-			'radialLayout: the font was reduced to fit them'
+			'radialLayout: every 20-way name stays complete'
 		);
 		eq(countOverlaps(reducedLayout), 0, 'radialLayout: the reduced text does not overlap');
 		assertSvgSane('sunburst (reduced font)', buildRadialSvg(reducedModel), reducedModel.nodes.size);
+
+		// The reported case: a small branch with a long name next to a dominant
+		// one. Weight-proportional wedges alone leave it a sliver, where
+		// "Mechanical Energy Conservation" cannot be drawn at any font size.
+		// "Energy Transformation Pathways" is here for a second reason: its words
+		// pack into three lines, not the two a character count predicts, which is
+		// what used to make it vanish from the export entirely.
+		const smallNames = [
+			'Mechanical Energy Conservation',
+			'Thermodynamics in Chemistry',
+			'Energy Transformation',
+			'Energy Transformation Pathways',
+		];
+		const bigLeaves = Array.from({ length: 30 }, (_, i) => `Mechanics Topic ${i + 1}`);
+		const unbalanced: TreeModel = {
+			root: 'Energy',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Energy', node('Energy', null, [...smallNames, 'Classical Mechanics'])],
+				...smallNames.map((name) => [name, node(name, 'Energy')] as [string, TreeNode]),
+				['Classical Mechanics', node('Classical Mechanics', 'Energy', bigLeaves)],
+				...bigLeaves.map(
+					(name) => [name, node(name, 'Classical Mechanics')] as [string, TreeNode]
+				),
+			]),
+		};
+		const unbalancedLayout = radialLayout(unbalanced);
+		for (const name of smallNames) {
+			const label = unbalancedLayout.labels.find((entry) => entry.name === name);
+			assert(!!label, `radialLayout: "${name}" gets a label`);
+			assert(
+				label?.lines.join(' ').replace(/\s+/g, '') === name.replace(/\s+/g, ''),
+				`radialLayout: "${name}" is shown in full beside a dominant branch`
+			);
+		}
+		eq(
+			unbalancedLayout.labels.filter((label) => label.shortened).length,
+			0,
+			'radialLayout: nothing is cut in an unbalanced tree'
+		);
+		eq(countOverlaps(unbalancedLayout), 0, 'radialLayout: the unbalanced tree does not overlap');
+		const spanOf = new Map(unbalancedLayout.arcs.map((arc) => [arc.name, arc.to - arc.from]));
+		assert(
+			(spanOf.get('Classical Mechanics') ?? 0) > (spanOf.get(smallNames[0]) ?? 0) * 3,
+			'radialLayout: the dominant branch still owns the widest wedge'
+		);
+		const ringTotal = unbalancedLayout.arcs
+			.filter((arc) => arc.depth === 1)
+			.reduce((sum, arc) => sum + (arc.to - arc.from), 0);
+		assert(
+			Math.abs(ringTotal - Math.PI * 2) < 0.2,
+			`radialLayout: the first ring still covers the circle (${ringTotal.toFixed(2)} of ${(
+				Math.PI * 2
+			).toFixed(2)})`
+		);
+		assertSvgSane('sunburst (unbalanced)', buildRadialSvg(unbalanced), unbalanced.nodes.size);
 
 		// The root label lives in the disc, so a long root name must be shortened too.
 		const longRoot: TreeModel = {
