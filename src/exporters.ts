@@ -212,6 +212,36 @@ const LABEL_HEADROOM = 1.04;
 const NOTE_FONT_SIZE = 11;
 const NOTE_LINE_HEIGHT = 15;
 
+/**
+ * Names that could not be drawn in full, wrapped as a note to put under the
+ * drawing. An arc a few pixels wide cannot hold text and a box has its limits,
+ * but the concept still has a name — it is listed rather than lost.
+ */
+function noteLines(names: string[], widthPx: number): string[] {
+	if (names.length === 0) return [];
+	const perLine = Math.max(
+		24,
+		Math.floor((widthPx - 48) / (NOTE_FONT_SIZE * avgCharWidthEm(names.join(' '))))
+	);
+	const lines: string[] = [
+		names.length === 1
+			? '1 concept is too narrow to label:'
+			: `${names.length} concepts are too narrow to label:`,
+	];
+	let current = '';
+	for (const name of names) {
+		const candidate = current ? `${current} · ${name}` : name;
+		if (candidate.length <= perLine) {
+			current = candidate;
+			continue;
+		}
+		if (current) lines.push(current);
+		current = name;
+	}
+	if (current) lines.push(current);
+	return lines;
+}
+
 export interface RadialArc {
 	name: string;
 	depth: number;
@@ -831,29 +861,8 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 
 	// An arc a couple of pixels wide can never hold text, but the concept still
 	// has a name — list those under the drawing instead of losing them.
-	if (result.unlabelled.length > 0) {
-		const perLine = Math.max(
-			24,
-			Math.floor(
-				(result.size - 48) / (NOTE_FONT_SIZE * avgCharWidthEm(result.unlabelled.join(' ')))
-			)
-		);
-		const note: string[] = [
-			result.unlabelled.length === 1
-				? '1 concept is too narrow to label:'
-				: `${result.unlabelled.length} concepts are too narrow to label:`,
-		];
-		let current = '';
-		for (const name of result.unlabelled) {
-			const candidate = current ? `${current} · ${name}` : name;
-			if (candidate.length <= perLine) {
-				current = candidate;
-				continue;
-			}
-			if (current) note.push(current);
-			current = name;
-		}
-		if (current) note.push(current);
+	const note = noteLines(result.unlabelled, result.size);
+	if (note.length > 0) {
 		result.note = note;
 		result.height = result.size + note.length * NOTE_LINE_HEIGHT + 26;
 	}
@@ -1004,68 +1013,148 @@ export function buildJsonSnapshot(model: TreeModel): string {
 
 const NODE_H = 34;
 const LAYER_GAP = 70;
-const LEAF_W = 130;
-const MIN_W = 110;
+/** Margin around the whole diagram. */
 const PAD = 24;
+/** Horizontal padding inside a node box, and the gap between sibling subtrees. */
+const NODE_PAD_X = 28;
+const SIBLING_GAP = 20;
+const MIN_NODE_W = 96;
+/** A box may grow to this, then its label shrinks, and only then is ellipsised. */
+const MAX_NODE_W = 320;
+const TREE_MIN_FONT = 9.5;
+/** Font sizes a node label may shrink through, largest first. */
+const TREE_FONTS = [12, 11, 10, 9.5];
 
 interface LayoutNode {
 	x: number;
 	y: number;
 	w: number;
+	/** The label as drawn (possibly ellipsised), and the size it is drawn at. */
+	text: string;
+	font: number;
 }
 
-/** Layered SVG diagram of the tree (nodes + curved parent→child connectors). */
+/** The label as drawn for a node: shrunk to fit the box, then ellipsised. */
+function fitTreeLabel(name: string): { text: string; font: number } {
+	const budget = MAX_NODE_W - NODE_PAD_X;
+	const font =
+		TREE_FONTS.find((size) => estimateTextWidth(name, size) <= budget) ??
+		TREE_MIN_FONT;
+	if (estimateTextWidth(name, font) <= budget) return { text: name, font };
+	let cut = name.length;
+	while (cut > 1 && estimateTextWidth(`${name.slice(0, cut - 1)}…`, font) > budget) {
+		cut--;
+	}
+	return { text: `${name.slice(0, Math.max(1, cut - 1))}…`, font };
+}
+
+/**
+ * Layered SVG diagram of the tree (nodes + curved parent→child connectors).
+ *
+ * Each subtree owns a disjoint horizontal interval, sized as the larger of its
+ * own box and the intervals of its children plus a gap. Boxes are then centred
+ * inside their interval, so two boxes can never overlap — the earlier version
+ * spaced columns by leaf count while boxes were up to 240px wide, and a wide
+ * box simply sat on top of its neighbour.
+ *
+ * Boxes are sized from the measured width of the label rather than a character
+ * count, so a long concept name is not drawn outside its own rectangle. That
+ * makes a wide tree wider still, so a long name shrinks before it is cut, and
+ * anything still too long is listed under the drawing.
+ */
 export function buildTreeSvg(model: TreeModel): string {
 	const nodes = model.nodes;
 	const depth = computeDepths(model);
-	const leafSpan = new Map<string, number>();
-	const layout = new Map<string, LayoutNode>();
+	const labels = new Map<string, { text: string; font: number }>();
+	for (const name of nodes.keys()) labels.set(name, fitTreeLabel(name));
 
-	const span = (name: string, open: Set<string>): number => {
+	/** The label as drawn for a node, from the precomputed table. */
+	const labelOf = (name: string): { text: string; font: number } =>
+		labels.get(name) ?? fitTreeLabel(name);
+	const boxW = (name: string): number => {
+		const label = labelOf(name);
+		return Math.max(
+			MIN_NODE_W,
+			Math.min(MAX_NODE_W, estimateTextWidth(label.text, label.font) + NODE_PAD_X)
+		);
+	};
+
+	/** Width a subtree needs, cycle-safe (hand-edited frontmatter can loop). */
+	const slots = new Map<string, number>();
+	const measure = (name: string, open: Set<string>): number => {
 		const n = nodes.get(name);
 		if (!n) return 0;
-		if (open.has(name)) return 0; // frontmatter cycle: stop descending
+		if (open.has(name)) return 0;
 		open.add(name);
-		if (n.children.length === 0) {
-			leafSpan.set(name, LEAF_W);
-			open.delete(name);
-			return LEAF_W;
-		}
-		let s = 0;
-		for (const c of n.children) s += span(c, open);
-		const sp = Math.max(s, 120);
-		leafSpan.set(name, sp);
+		const children = (n.children ?? []).filter((child) => nodes.has(child));
+		let childrenW = 0;
+		children.forEach((child, index) => {
+			childrenW += measure(child, open) + (index > 0 ? SIBLING_GAP : 0);
+		});
 		open.delete(name);
-		return sp;
+		const width = Math.max(boxW(name), childrenW);
+		slots.set(name, width);
+		return width;
 	};
-	span(model.root, new Set());
+	measure(model.root, new Set());
 
-	const boxW = (name: string) => Math.max(MIN_W, Math.min(240, name.length * 7.2 + 22));
-
+	const layout = new Map<string, LayoutNode>();
 	let minX = 0;
 	let maxX = 0;
+	/** Place `name` inside [left, left + its slot]; returns the slot width used. */
 	const place = (name: string, left: number, open: Set<string>): number => {
 		const n = nodes.get(name);
 		if (!n) return 0;
-		if (open.has(name)) return 0; // cycle guard (mirrors span())
+		if (open.has(name)) return 0;
 		open.add(name);
-		const sp = leafSpan.get(name) ?? LEAF_W;
-		const cx = left + sp / 2;
+		const slot = slots.get(name) ?? MIN_NODE_W;
 		const w = boxW(name);
-		const x = cx - w / 2;
-		layout.set(name, { x, y: (depth.get(name) ?? 0) * LAYER_GAP, w });
+		const children = (n.children ?? []).filter((child) => nodes.has(child));
+		if (children.length === 0) {
+			const x = left + (slot - w) / 2;
+			layout.set(name, { x, y: (depth.get(name) ?? 0) * LAYER_GAP, w, ...labelOf(name) });
+			minX = Math.min(minX, x);
+			maxX = Math.max(maxX, x + w);
+			open.delete(name);
+			return slot;
+		}
+		// Children take the whole slot, left to right; each one is placed inside
+		// its own slot — which may be wider than the children it holds, when its
+		// own box is the widest thing in it — so siblings cannot overlap.
+		let cursor = left;
+		const childSlots: number[] = [];
+		for (const child of children) {
+			const childSlot = slots.get(child) ?? MIN_NODE_W;
+			place(child, cursor, open);
+			childSlots.push(childSlot);
+			cursor += childSlot + SIBLING_GAP;
+		}
+		const childrenW =
+			childSlots.reduce((sum, width) => sum + width, 0) +
+			Math.max(0, children.length - 1) * SIBLING_GAP;
+		const centre = left + childrenW / 2;
+		const x = Math.max(left, Math.min(left + slot - w, centre - w / 2));
+		layout.set(name, { x, y: (depth.get(name) ?? 0) * LAYER_GAP, w, ...labelOf(name) });
 		minX = Math.min(minX, x);
 		maxX = Math.max(maxX, x + w);
-		let cur = left;
-		for (const c of n.children) cur += place(c, cur, open);
 		open.delete(name);
-		return sp;
+		return slot;
 	};
+	// `slots` is measured first, so a parent can be centred over its children's
+	// true extent while placing them: one pass is enough.
 	place(model.root, 0, new Set());
 
 	const maxDepth = Math.max(0, ...depth.values());
-	const totalW = maxX - minX + PAD * 2;
-	const totalH = maxDepth * LAYER_GAP + NODE_H + PAD * 2;
+	const totalW = Math.round(maxX - minX + PAD * 2);
+	const diagramH = Math.round(maxDepth * LAYER_GAP + NODE_H + PAD * 2);
+	// Names that had to be shortened are listed under the drawing, so no concept
+	// is left unnamed in the export.
+	const shortened = [...layout.entries()]
+		.filter(([name, node]) => node.text !== name)
+		.map(([name]) => name);
+	const note = noteLines(shortened, totalW);
+	const noteHeight = note.length > 0 ? note.length * NOTE_LINE_HEIGHT + 26 : 0;
+	const totalH = diagramH + noteHeight;
 	const shiftX = PAD - minX;
 
 	const edges: string[] = [];
@@ -1091,17 +1180,27 @@ export function buildTreeSvg(model: TreeModel): string {
 		const l = layout.get(n.name);
 		if (!l) continue;
 		boxes.push(
-			`<g transform="translate(${l.x + shiftX}, ${l.y + PAD})">
-  <rect width="${l.w}" height="${NODE_H}" rx="8" fill="#f4f1ff" stroke="#b06cff" stroke-width="1"/>
-  <text x="${l.w / 2}" y="${NODE_H / 2 + 4}" text-anchor="middle" font-size="12" fill="#3a3550">${escapeXml(n.name)}</text>
+			`<g data-node="${escapeXml(n.name)}" transform="translate(${l.x + shiftX}, ${l.y + PAD})">
+  <rect width="${l.w.toFixed(1)}" height="${NODE_H}" rx="8" fill="#f4f1ff" stroke="#b06cff" stroke-width="1"/>
+  <text x="${(l.w / 2).toFixed(1)}" y="${NODE_H / 2 + 4}" text-anchor="middle" font-size="${l.font}" fill="#3a3550">${escapeXml(l.text)}</text>
 </g>`
 		);
 	}
+	const noteMarkup = note
+		.map(
+			(line, i) =>
+				`<text data-note="true" x="24" y="${(diagramH + 18 + i * NOTE_LINE_HEIGHT).toFixed(
+					1
+				)}" font-size="${NOTE_FONT_SIZE}" fill="#6b6480">${escapeXml(line)}</text>`
+		)
+		.join('\n');
 
 	return `<svg xmlns="http://www.w3.org/2000/svg" width="${totalW}" height="${totalH}" viewBox="0 0 ${totalW} ${totalH}" font-family="Inter, system-ui, sans-serif">
 <rect width="100%" height="100%" fill="#ffffff"/>
 ${edges.join('\n')}
 ${boxes.join('\n')}
+${noteMarkup}
 </svg>
 `;
 }
+

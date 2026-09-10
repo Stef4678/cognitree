@@ -733,7 +733,13 @@ import {
 }
 
 // --- radial sunburst export ----------------------------------------------
-import { analyseTree, buildRadialSvg, estimateTextWidth, radialLayout } from '../src/exporters';
+import {
+	analyseTree,
+	buildRadialSvg,
+	buildTreeSvg,
+	estimateTextWidth,
+	radialLayout,
+} from '../src/exporters';
 
 {
 	/** Sanity-check a generated SVG: finite geometry, every node drawn, nothing clipped. */
@@ -1592,8 +1598,145 @@ import { analyseTree, buildRadialSvg, estimateTextWidth, radialLayout } from '..
 		}
 	}
 
-	// The width model itself, pinned to real text measured in Inter and Segoe UI
-	// at label size (10.5px). Trimming the per-character table would make the
+	// The layered export: boxes must not sit on top of each other, and a label
+	// must not be drawn outside its own box. Both were true of every fixture
+	// before, because columns were spaced by leaf count while boxes were sized by
+	// character count and capped at 240px.
+	{
+		const eq = (actual: unknown, expected: unknown, label: string): void =>
+			assert(
+				actual === expected,
+				`${label} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`
+			);
+		const svgBoxes = (
+			svg: string
+		): { name: string; x: number; y: number; w: number; h: number; font: number; text: string }[] => {
+			const decode = (value: string): string =>
+				value
+					.replace(/&apos;/g, "'")
+					.replace(/&amp;/g, '&')
+					.replace(/&lt;/g, '<')
+					.replace(/&gt;/g, '>')
+					.replace(/&quot;/g, '"')
+					.replace(/&#39;/g, "'");
+			const boxes = [];
+			for (const m of svg.matchAll(
+				/<g\b[^>]*?transform="translate\(([\d.-]+), ([\d.-]+)\)"[^>]*>([\s\S]*?)<\/g>/g
+			)) {
+				const rect = m[3].match(/<rect width="([\d.-]+)" height="([\d.-]+)"/);
+				const text = m[3].match(/<text[^>]*font-size="([\d.-]+)"[^>]*>([\s\S]*?)<\/text>/);
+				if (!rect) continue;
+				boxes.push({
+					name: decode(m[0].match(/data-node="([^"]*)"/)?.[1] ?? ''),
+					x: Number(m[1]),
+					y: Number(m[2]),
+					w: Number(rect[1]),
+					h: Number(rect[2]),
+					font: text ? Number(text[1]) : 12,
+					text: text ? decode(text[2]) : '',
+				});
+			}
+			return boxes;
+		};
+		const countOverlappingBoxes = (svg: string): string[] => {
+			const boxes = svgBoxes(svg);
+			const problems: string[] = [];
+			for (let i = 0; i < boxes.length; i++) {
+				for (let j = i + 1; j < boxes.length; j++) {
+					const a = boxes[i];
+					const b = boxes[j];
+					const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+					const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+					if (ox > 0 && oy > 0) {
+						problems.push(
+							`"${a.text}" overlaps "${b.text}" by ${ox.toFixed(0)}x${oy.toFixed(0)}px`
+						);
+					}
+				}
+			}
+			return problems;
+		};
+		const labelsOutsideTheirBox = (svg: string): string[] =>
+			svgBoxes(svg)
+				.filter((box) => estimateTextWidth(box.text, box.font) > box.w - 8)
+				.map(
+					(box) =>
+						`"${box.text}" needs ${estimateTextWidth(box.text, box.font).toFixed(0)}px in ${box.w.toFixed(
+							0
+						)}px`
+				);
+
+		// Shaped like the reported tree: wide, uneven, and full of long names.
+		const trunk = 'Energy';
+		const longNames = [
+			'Green\u2019s Functions For Laplace\u2019s Equation',
+			'Elastic Potential Energy In Series And Parallel Spring Configurations',
+			'Conservation Of Angular Momentum In Rotating Reference Frames',
+			'Addition Theorem For Spherical Harmonics',
+			'Schl\u00e4fli Integral Representation',
+		];
+		const leaves = Array.from({ length: 24 }, (_, i) => `Mechanics Topic ${i + 1}`);
+		const layered: TreeModel = {
+			root: trunk,
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				[trunk, node(trunk, null, [...longNames, 'Classical Mechanics'])],
+				...longNames.map((name) => [name, node(name, trunk)] as [string, TreeNode]),
+				['Classical Mechanics', node('Classical Mechanics', trunk, leaves)],
+				...leaves.map((name) => [name, node(name, 'Classical Mechanics')] as [string, TreeNode]),
+			]),
+		};
+		const layeredSvg = buildTreeSvg(layered);
+		assertSvgSane('layered svg', layeredSvg, layered.nodes.size);
+		eq(countOverlappingBoxes(layeredSvg).length, 0, 'buildTreeSvg: no two node boxes overlap');
+		eq(
+			labelsOutsideTheirBox(layeredSvg).length,
+			0,
+			'buildTreeSvg: every label is drawn inside its own box'
+		);
+		assert(
+			layeredSvg.includes('Green\u2019s Functions For Laplace\u2019s Equation'),
+			'buildTreeSvg: a name that fits the widest box is drawn in full'
+		);
+		const boxes = svgBoxes(layeredSvg);
+		assert(
+			boxes.every((box) => box.x >= 0 && box.x + box.w <= Number(layeredSvg.match(/viewBox="0 0 ([\d.]+)/)![1])),
+			'buildTreeSvg: every box is inside the viewBox'
+		);
+		assert(
+			new Set(boxes.map((box) => box.name)).size === layered.nodes.size,
+			`buildTreeSvg: one box per node (${new Set(boxes.map((box) => box.name)).size}/${
+				layered.nodes.size
+			})`
+		);
+		// A label too long for any box is shortened, shrunk, and listed below.
+		const huge = `A concept name so long that no box can hold it ${'very '.repeat(8)}long`;
+		const hugeModel: TreeModel = {
+			root: 'Root',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Root', node('Root', null, [huge])],
+				[huge, node(huge, 'Root')],
+			]),
+		};
+		const hugeSvg = buildTreeSvg(hugeModel);
+		assertSvgSane('layered svg (huge name)', hugeSvg, 2);
+		eq(countOverlappingBoxes(hugeSvg).length, 0, 'buildTreeSvg: a huge name does not overlap');
+		eq(
+			labelsOutsideTheirBox(hugeSvg).length,
+			0,
+			'buildTreeSvg: a huge name is still drawn inside its box'
+		);
+		assert(hugeSvg.includes('too narrow to label'), 'buildTreeSvg: the shortened name is listed');
+		assert(
+			hugeSvg.includes(`data-node="${huge}"`),
+			'buildTreeSvg: the full name survives in data-node'
+		);
+	}
+
+	// The width model itself, pinned to real text measured in Inter and Segoe UI	// at label size (10.5px). Trimming the per-character table would make the
 	// containment checks above pass while labels spill in a real viewer.
 	for (const [name, measured] of [
 		['Work-Energy Theorem', 104.8],
