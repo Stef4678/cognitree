@@ -162,8 +162,44 @@ export interface RadialOptions {
 	radiusScaleLimit?: number;
 }
 
-/** Rough advance width per character for the label font stack (deliberately generous). */
-const CHAR_WIDTH_EM = 0.58;
+/**
+ * Advance width of one character, in em, for the label font stack. Measured
+ * against Inter and Segoe UI at label size. A single average hides the fact
+ * that "W" is nearly four times as wide as "i": a wedge sized for
+ * "Thermodynamics in Chemistry" (0.50 em/char) is far too narrow for
+ * "MMMMMMM WWWWWW" (0.87 em/char), and the label then runs over its
+ * neighbours.
+ */
+const charWidthEm = (ch: string): number => {
+	if (ch === ' ') return 0.26;
+	if ('MW@%&'.includes(ch)) return 0.92;
+	if ('mw'.includes(ch)) return 0.8;
+	if ('ilj.,;:!|\'`'.includes(ch)) return 0.26;
+	if ('frt()[]{}/\\-'.includes(ch)) return 0.37;
+	if (ch >= '0' && ch <= '9') return 0.56;
+	if (ch >= 'A' && ch <= 'Z') return 0.68;
+	return 0.53;
+};
+
+/** Width of `text` in px at `fontSize`, from the per-character table. */
+export function estimateTextWidth(text: string, fontSize: number): number {
+	let em = 0;
+	for (const ch of text) em += charWidthEm(ch);
+	return em * fontSize;
+}
+
+/**
+ * Average advance per character of `text`, in em, plus a small safety margin.
+ * Wrapping works in characters, so this is what turns a pixel budget into a
+ * character budget for one particular name.
+ */
+const avgCharWidthEm = (text: string): number => {
+	if (!text) return 0.53;
+	return (estimateTextWidth(text, 1) / text.length) * WIDTH_SAFETY;
+};
+
+/** Margin over the measured advances, for renderers whose font is slightly wider. */
+const WIDTH_SAFETY = 1.06;
 
 /**
  * Slack demanded when deciding whether a label still needs more room. Without
@@ -370,19 +406,42 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 			lineHeight: number;
 		}
 
-		/** Layout options for one font size at one arc. */
-		const shapesAt = (span: number, innerRadius: number, midRadius: number, fontSize: number) => {
-			const charWidth = fontSize * CHAR_WIDTH_EM;
+		/** Layout options for one font size at one arc, for a name of `widthEm` per character. */
+		const shapesAt = (
+			span: number,
+			innerRadius: number,
+			midRadius: number,
+			fontSize: number,
+			widthEm: number
+		) => {
+			const charWidth = fontSize * widthEm;
 			const lineHeight = fontSize * 1.25;
+			// The glyph box is a little taller than the line advance and is centred
+			// on the anchor, so a line costs `0.51em` beyond the baseline span.
+			const boxPad = fontSize * 0.51;
+			const maxLinesTangential = Math.max(
+				1,
+				Math.min(
+					maxLabelLines,
+					1 + Math.floor((ringThickness - 8 - 2 * boxPad) / lineHeight)
+				)
+			);
+			// A tangential block is centred on the ring's middle, so its inner
+			// corner sits half the block's height closer to the centre — where the
+			// same number of pixels spans a wider angle. Size the line to that
+			// edge, and also to what keeps the block's far corners inside the ring
+			// itself: a long flat line is not contained by the arc length alone.
+			const cornerRadius =
+				midRadius - ((maxLinesTangential - 1) * lineHeight) / 2 - boxPad;
+			const arcOuter = innerRadius - 6 + ringThickness;
+			const widthCap = 2 * Math.sqrt(Math.max(0, arcOuter * arcOuter - cornerRadius * cornerRadius));
+			const tangentialBudget = Math.min(span * cornerRadius - 6, widthCap);
 			return [
 				{
 					orientation: 'tangential' as const,
-					perLine: Math.floor((span * midRadius - 6) / charWidth),
-					maxLines: Math.max(
-						1,
-						Math.min(maxLabelLines, Math.floor((ringThickness - 8) / lineHeight))
-					),
-					arcLength: span * midRadius,
+					perLine: Math.floor(tangentialBudget / charWidth),
+					maxLines: maxLinesTangential,
+					arcLength: span * cornerRadius,
 				},
 				{
 					orientation: 'radial' as const,
@@ -390,10 +449,61 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 					// Lines stack along the arc, so how many fit depends on the arc at the
 					// inner edge. Zero means a radial label cannot be placed without
 					// spilling over its neighbours, so this orientation is dropped.
-					maxLines: Math.min(maxLabelLines, Math.floor((span * innerRadius) / lineHeight)),
+					maxLines: Math.min(
+						maxLabelLines,
+						1 + Math.floor((span * innerRadius - 2 * boxPad) / lineHeight)
+					),
 					arcLength: span * innerRadius,
 				},
 			];
+		};
+
+		/**
+		 * How far a label's text block would spill out of its own arc, in px. A
+		 * block is symmetric about the middle of its arc, so this needs no absolute
+		 * angles: only the arc's radii and the widest line. Zero means it fits.
+		 *
+		 * `shapesAt` sizes the text so this should already be zero everywhere; it
+		 * is checked rather than assumed, because a wrong anchor, rotation or line
+		 * height is invisible in the arithmetic until it is placed.
+		 */
+		const overflowInArc = (
+			lines: string[],
+			orientation: 'tangential' | 'radial',
+			fontSize: number,
+			lineHeight: number,
+			span: number,
+			innerRadius: number,
+			midRadius: number
+		): number => {
+			const width = Math.max(...lines.map((line) => estimateTextWidth(line, fontSize)));
+			const halfSpan = span / 2;
+			const arcOuter = innerRadius - 6 + ringThickness;
+			// The block is centred on the glyph box, not on the baselines (see the
+			// renderer), so it reaches the same distance either side of the anchor.
+			const boxHalf = ((lines.length - 1) * lineHeight) / 2 + fontSize * 0.51;
+			if (orientation === 'radial') {
+				// Runs outward from the inner edge; the lines stack across the arc,
+				// which is narrowest right here, so measure them at this radius.
+				const angular = boxHalf / innerRadius - halfSpan;
+				const radial = width - (arcOuter - innerRadius);
+				return Math.max(0, angular * innerRadius, radial);
+			}
+			// Tangential: centred on the ring. The block is a flat rectangle inside a
+			// curved ring, so both the angle it subtends (worst at the inner edge)
+			// and the corners it pushes outwards have to fit.
+			const halfWidth = width / 2;
+			const innerComponent = midRadius - boxHalf;
+			const outerComponent = midRadius + boxHalf;
+			const angular = Math.atan2(halfWidth, Math.max(1, innerComponent)) - halfSpan;
+			const outerCorner = Math.hypot(outerComponent, halfWidth);
+			const innerCorner = Math.hypot(innerComponent, halfWidth);
+			return Math.max(
+				0,
+				angular * Math.max(1, innerComponent),
+				outerCorner - arcOuter,
+				innerRadius - 6 - innerCorner
+			);
 		};
 
 		/**
@@ -409,14 +519,48 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 		const fit = (name: string, span: number, innerRadius: number, midRadius: number): Fitted | null => {
 			const capped = cappedName(name);
 			const shortened = capped !== name;
+			const widthEm = avgCharWidthEm(capped);
+
+			/**
+			 * Wrap `text` into a shape and keep narrowing it until the real glyph
+			 * advances fit the arc. Wrapping itself counts characters using the
+			 * name's average advance, but one line can be made of wider-than-average
+			 * glyphs ("MMM" inside "Conservation"), so the wrapped block is measured
+			 * and the line shortened until it fits.
+			 */
+			const wrapToFit = (
+				text: string,
+				shape: { orientation: 'tangential' | 'radial'; perLine: number; maxLines: number },
+				fontSize: number,
+				lineHeight: number
+			): { lines: string[]; hardBreak: boolean } | null => {
+				for (let perLine = shape.perLine; perLine >= 4; perLine--) {
+					const wrapped = wrap(text, perLine, shape.maxLines);
+					if (!wrapped) return null; // a narrower line cannot fit either
+					if (
+						overflowInArc(
+							wrapped.lines,
+							shape.orientation,
+							fontSize,
+							lineHeight,
+							span,
+							innerRadius,
+							midRadius
+						) <= 0
+					) {
+						return wrapped;
+					}
+				}
+				return null;
+			};
 
 			for (const allowHardBreak of [false, true]) {
 				for (const fontSize of fontSizes) {
 					const lineHeight = fontSize * 1.25;
-					const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
+					const shapes = shapesAt(span, innerRadius, midRadius, fontSize, widthEm);
 					for (const shape of shapes) {
 						if (shape.perLine < 4 || shape.maxLines < 1) continue;
-						const wrapped = wrap(capped, shape.perLine, shape.maxLines);
+						const wrapped = wrapToFit(capped, shape, fontSize, lineHeight);
 						if (!wrapped) continue;
 						if (wrapped.hardBreak && !allowHardBreak) continue;
 						return {
@@ -437,7 +581,7 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 			// possible from the size with the most room.
 			for (const fontSize of [...fontSizes].reverse()) {
 				const lineHeight = fontSize * 1.25;
-				const shapes = shapesAt(span, innerRadius, midRadius, fontSize);
+				const shapes = shapesAt(span, innerRadius, midRadius, fontSize, widthEm);
 				const best = shapes
 					.slice()
 					.sort((a, b) => b.perLine * b.maxLines - a.perLine * a.maxLines)[0];
@@ -448,7 +592,7 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 				// keep the ring-growing pass asking for room it does not need.
 				const dropped = capacity - 1 < capped.length;
 				const text = dropped ? `${capped.slice(0, capacity - 1)}…` : capped;
-				const wrapped = wrap(text, best.perLine, best.maxLines);
+				const wrapped = wrapToFit(text, best, fontSize, lineHeight);
 				if (!wrapped) continue;
 				return {
 					lines: wrapped.lines,
@@ -474,10 +618,12 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 			const radius = Math.max(1, centerRadius + Math.max(0, nodeDepth - 1) * ringWidth + 6);
 			const perLine = Math.max(
 				1,
-				Math.floor((ringThickness - 12) / (minFontSize * CHAR_WIDTH_EM))
+				Math.floor((ringThickness - 12) / (minFontSize * avgCharWidthEm(cappedName(name))))
 			);
 			const lines = greedyLines(cappedName(name), perLine);
-			return (lines * minFontSize * 1.25) / radius + 2 * gap;
+			// Height of the centred glyph box, which is what has to fit the arc.
+			const height = (lines - 1) * minFontSize * 1.25 + minFontSize * 1.02;
+			return height / radius + 2 * gap;
 		};
 
 		/**
@@ -497,9 +643,10 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 			if (name.length > maxLabelChars) return 1;
 			const perLine = Math.max(
 				1,
-				Math.floor((ringThickness - 12) / (minFontSize * CHAR_WIDTH_EM))
+				Math.floor((ringThickness - 12) / (minFontSize * avgCharWidthEm(cappedName(name))))
 			);
-			const wanted = greedyLines(cappedName(name), perLine) * minFontSize * 1.25;
+			const lines = greedyLines(cappedName(name), perLine);
+			const wanted = (lines - 1) * minFontSize * 1.25 + minFontSize * 1.02;
 			// A little headroom, so growth stops past the boundary rather than a
 			// hair short of it, which would leave the name cut.
 			return Math.max(1, (wanted * LABEL_HEADROOM) / (span * radius));
@@ -561,9 +708,14 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 				const fitted = fit(node.name, span, inner + 6, radius);
 				demand = Math.max(demand, neededScale(node.name, span, inner + 6, fitted));
 				if (fitted) {
-					const longest = Math.max(...fitted.lines.map((line) => line.length));
-					const degrees = (angle * 180) / Math.PI;
-					const flipped = degrees > 90 && degrees < 270;
+					// A tangential label runs along the arc, so its baseline is a
+					// quarter turn from the radius; a radial label runs along the
+					// radius. Whichever way it points, text on the left half is
+					// turned the other way round so it never reads upside down.
+					const baseline = fitted.orientation === 'radial' ? angle : angle + Math.PI / 2;
+					const baselineDegrees = (baseline * 180) / Math.PI;
+					const upright = ((baselineDegrees % 360) + 360) % 360;
+					const flipped = upright > 90 && upright < 270;
 					const [px, py] =
 						fitted.orientation === 'radial'
 							? flipped
@@ -576,7 +728,9 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 					const tangentialExtent =
 						fitted.orientation === 'radial'
 							? fitted.lines.length * fitted.lineHeight
-							: longest * fitted.fontSize * CHAR_WIDTH_EM;
+							: Math.max(
+									...fitted.lines.map((line) => estimateTextWidth(line, fitted.fontSize))
+								);
 					const footprintRadius = fitted.orientation === 'radial' ? inner + 6 : radius;
 					labels.push({
 						name,
@@ -587,8 +741,12 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 						radius,
 						x: px,
 						y: py,
-						rotation: flipped ? degrees + 180 : degrees,
-						anchor: fitted.orientation === 'radial' ? (flipped ? 'end' : 'start') : 'middle',
+						rotation: flipped ? baselineDegrees + 180 : baselineDegrees,
+						// A radial label always starts at the edge it is anchored to and
+						// reads inward on the left half, outward on the right half. Ending
+						// the text at the anchor instead would push the whole name out
+						// past the outer edge of the ring.
+						anchor: fitted.orientation === 'radial' ? 'start' : 'middle',
 						fontSize: fitted.fontSize,
 						lineHeight: fitted.lineHeight,
 						halfAngle: tangentialExtent / 2 / footprintRadius,
@@ -636,7 +794,13 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 		const rootLineHeight = rootFont * 1.25;
 		// The root label sits in a disc, so it wraps to the chord across it.
 		const rootLines =
-			wrap(rootName, Math.floor((2 * (centerRadius - 14)) / (rootFont * CHAR_WIDTH_EM)), 2)?.lines ?? [];
+			wrap(
+				rootName,
+				Math.floor(
+					(2 * (centerRadius - 14)) / (rootFont * avgCharWidthEm(rootName))
+				),
+				2
+			)?.lines ?? [];
 
 		return {
 			size,
@@ -670,7 +834,9 @@ export function radialLayout(model: TreeModel, options: RadialOptions = {}): Rad
 	if (result.unlabelled.length > 0) {
 		const perLine = Math.max(
 			24,
-			Math.floor((result.size - 48) / (NOTE_FONT_SIZE * CHAR_WIDTH_EM))
+			Math.floor(
+				(result.size - 48) / (NOTE_FONT_SIZE * avgCharWidthEm(result.unlabelled.join(' ')))
+			)
 		);
 		const note: string[] = [
 			result.unlabelled.length === 1
@@ -744,7 +910,14 @@ export function buildRadialSvg(model: TreeModel, options: RadialOptions = {}): s
 		.map((label) => {
 			const tspans = label.lines
 				.map((line, i) => {
-					const dy = i === 0 ? -((label.lines.length - 1) * label.lineHeight) / 2 : label.lineHeight;
+					// Centre the glyph box, not the baselines: a line reaches 0.78em
+					// above its baseline but only 0.24em below, so baseline-centred
+					// text sits high and pokes out of a narrow arc.
+					const dy =
+						i === 0
+							? -((label.lines.length - 1) * label.lineHeight) / 2 +
+								label.fontSize * 0.27
+							: label.lineHeight;
 					return `<tspan x="${round(label.x)}" dy="${round(dy)}">${escapeXml(line)}</tspan>`;
 				})
 				.join('');

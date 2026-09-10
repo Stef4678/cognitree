@@ -733,7 +733,7 @@ import {
 }
 
 // --- radial sunburst export ----------------------------------------------
-import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
+import { analyseTree, buildRadialSvg, estimateTextWidth, radialLayout } from '../src/exporters';
 
 {
 	/** Sanity-check a generated SVG: finite geometry, every node drawn, nothing clipped. */
@@ -780,8 +780,218 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		assert(outside === 0, `${label}: nothing drawn outside the viewBox (${outside} outside)`);
 	};
 
-	const node = (name: string, parent: string | null, children: string[] = []): TreeNode => ({
-		name,
+	/**
+	 * Labels whose text block leaves its own arc. This is the check that
+	 * matters most and the one a reader notices first: an arc is a cell, and a
+	 * name that spills out of it runs over its neighbours.
+	 *
+	 * It reconstructs where the renderer will actually put the glyphs — the
+	 * anchor, the rotation, every wrapped line — and tests that block against
+	 * the arc, so a wrong anchor or rotation fails here even though the text
+	 * "fits" by length. `slack` widens the measured advances, so the check does
+	 * not merely repeat the layout's own assumption.
+	 */
+	const countOutsideTheirArc = (
+		layout: ReturnType<typeof radialLayout>,
+		slack = 1
+	): { count: number; worst: string } => {
+		const arcOf = new Map(layout.arcs.map((arc) => [arc.name, arc]));
+		const norm = (a: number): number => ((a % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+		let count = 0;
+		let worst = '';
+		let worstOver = 0;
+		for (const label of layout.labels) {
+			const arc = arcOf.get(label.name);
+			if (!arc) continue;
+			const width =
+				Math.max(...label.lines.map((line) => estimateTextWidth(line, label.fontSize))) * slack;
+			const left =
+				label.anchor === 'middle' ? -width / 2 : label.anchor === 'end' ? -width : 0;
+			// The renderer centres the glyph box on the anchor, so the block reaches
+			// the same distance either side: 0.51em beyond the baseline span.
+			const boxHalf = ((label.lines.length - 1) * label.lineHeight) / 2 + label.fontSize * 0.51;
+			const top = -boxHalf;
+			const bottom = boxHalf;
+			const radians = (label.rotation * Math.PI) / 180;
+			const cos = Math.cos(radians);
+			const sin = Math.sin(radians);
+			let over = 0;
+			for (const [lx, ly] of [
+				[left, top],
+				[left + width, top],
+				[left, bottom],
+				[left + width, bottom],
+			]) {
+				const px = label.x + lx * cos - ly * sin;
+				const py = label.y + lx * sin + ly * cos;
+				const r = Math.hypot(px - layout.cx, py - layout.cy);
+				const angle = norm(Math.atan2(py - layout.cy, px - layout.cx));
+				// Raw span, wrapped into [0, 2pi): normalising it would turn a
+				// full-circle arc (0 to 2pi) into a zero-width one.
+				let span = arc.to - arc.from;
+				if (span < 0) span += Math.PI * 2;
+				const rel = norm(angle - arc.from);
+				const angleOver = rel > span ? Math.min(rel - span, Math.PI * 2 - rel) * r : 0;
+				const radiusOver =
+					r > arc.outer ? r - arc.outer : r < arc.inner ? arc.inner - r : 0;
+				over = Math.max(over, angleOver, radiusOver);
+			}
+			if (over > 0.5) {
+				count++;
+				if (over > worstOver) {
+					worstOver = over;
+					worst = `${label.name} (${label.orientation}, anchor ${label.anchor}, ${over.toFixed(0)}px)`;
+				}
+			}
+		}
+		return { count, worst };
+	};
+	/** Assert no label leaves its cell, at the layout's own width and a wider one. */
+	const assertLabelsInsideTheirArcs = (
+		label: string,
+		layout: ReturnType<typeof radialLayout>
+	): void => {
+		for (const factor of [1, 1.05]) {
+			const { count, worst } = countOutsideTheirArc(layout, factor);
+			assert(
+				count === 0,
+				`${label}: every label stays inside its own arc (advances +${Math.round(
+					(factor - 1) * 100
+				)}%) (got ${count}, want 0)` + (worst ? ` — worst: ${worst}` : '')
+			);
+		}
+	};
+
+	/**
+	 * Check the left-half radial labels and count them. Those are the labels a
+	 * reader notices first when they break: a radial label is drawn upside down
+	 * on the left half unless it is flipped, and flipping has to swap the edge it
+	 * is anchored to. Anchored at the inner edge with a flipped rotation, the
+	 * whole name runs outward off the circle instead of inward along the ring.
+	 */
+	const checkLeftHalfRadialLabels = (
+		label: string,
+		layout: ReturnType<typeof radialLayout>
+	): number => {
+		let count = 0;
+		for (const entry of layout.labels) {
+			if (
+				entry.orientation !== 'radial' ||
+				entry.angle <= Math.PI / 2 ||
+				entry.angle >= (3 * Math.PI) / 2
+			) {
+				continue;
+			}
+			count++;
+			const arc = layout.arcs.find((candidate) => candidate.name === entry.name);
+			const anchorRadius = Math.hypot(entry.x - layout.cx, entry.y - layout.cy);
+			assert(entry.anchor === 'start', `${label}: a left-half radial label reads inward`);
+			assert(
+				!!arc && Math.abs(anchorRadius - (arc.outer - 6)) < 1.5,
+				`${label}: "${entry.name}" is anchored at the outer edge of its ring (${anchorRadius.toFixed(
+					1
+				)} vs ${arc?.outer.toFixed(1)})`
+			);
+		}
+		return count;
+	};
+
+	/**
+	 * Structural problems in the rendered SVG — the properties that were actually
+	 * wrong when labels spilled out of their cells, and which need no guess at
+	 * font metrics:
+	 *   - a label's anchor point must sit inside the wedge it belongs to;
+	 *   - tangential text must be turned a quarter turn from its radius and
+	 *     radial text along it, or the text runs the wrong way across the arc it
+	 *     was measured against;
+	 *   - a radial label must be anchored on the edge it reads from (inner for
+	 *     the right half, outer for the left), and a tangential one on the ring's
+	 *     middle;
+	 *   - the first tspan must offset the block so its glyph box, not its
+	 *     baselines, is centred on the anchor.
+	 */
+	const svgLabelProblems = (svg: string): string[] => {
+		const circle = svg.match(/<circle data-node="[^"]*" cx="([\d.-]+)" cy="([\d.-]+)"/);
+		if (!circle) return ['no root circle'];
+		const cx = Number(circle[1]);
+		const cy = Number(circle[2]);
+		const attr = (tag: string, name: string): string | undefined =>
+			tag.match(new RegExp(`(?:^|\\s)${name}="([^"]*)"`))?.[1];
+		const norm = (a: number): number => ((a % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+		const arcs = [
+			...svg.matchAll(
+				/<path data-node="([^"]*)"[^>]*d="M ([\d.-]+) ([\d.-]+) A ([\d.-]+) [\d.-]+ 0 \d 1 ([\d.-]+) ([\d.-]+) L ([\d.-]+) ([\d.-]+) A ([\d.-]+)/g
+			),
+		].map((m) => ({
+			name: m[1],
+			rOuter: Number(m[4]),
+			rInner: Number(m[9]),
+			from: norm(Math.atan2(Number(m[3]) - cy, Number(m[2]) - cx)),
+			to: norm(Math.atan2(Number(m[6]) - cy, Number(m[5]) - cx)),
+		}));
+		const problems: string[] = [];
+		for (const m of svg.matchAll(/<text ([^>]*)>([\s\S]*?)<\/text>/g)) {
+			const attrs = m[1];
+			if (!/transform="rotate\(/.test(attrs)) continue;
+			const font = Number(attr(attrs, 'font-size') ?? 10);
+			const x = Number(attr(attrs, 'x'));
+			const y = Number(attr(attrs, 'y'));
+			const spin = Number(attr(attrs, 'transform')!.match(/rotate\((-?[\d.]+)/)![1]);
+			const dys = [...m[2].matchAll(/<tspan[^>]*dy="([\d.-]+)"/g)].map((t) => Number(t[1]));
+			const label = attr(attrs, 'data-node') ?? m[2].replace(/<[^>]*>/g, ' ').trim().slice(0, 30);
+			if (!dys.length) continue;
+			const r = Math.hypot(x - cx, y - cy);
+			const anchorAngle = norm(Math.atan2(y - cy, x - cx));
+			let span = 0;
+			const arc = arcs.find((candidate) => {
+				if (r < candidate.rInner - 1 || r > candidate.rOuter + 1) return false;
+				span = norm(candidate.to - candidate.from);
+				return norm(anchorAngle - candidate.from) <= span;
+			});
+			if (!arc) {
+				problems.push(`"${label}" is anchored outside every wedge`);
+				continue;
+			}
+			// Orientation, from the emitted rotation against the anchor's radius.
+			let delta = norm((spin * Math.PI) / 180 - anchorAngle);
+			if (delta > Math.PI) delta = Math.PI * 2 - delta;
+			const tangential = Math.abs(delta - Math.PI / 2) < 0.2;
+			const radial = delta < 0.2 || Math.abs(delta - Math.PI) < 0.2;
+			if (!tangential && !radial) {
+				problems.push(
+					`"${label}" is rotated ${((delta * 180) / Math.PI).toFixed(0)}deg off its radius ` +
+						`(neither along nor across it)`
+				);
+				continue;
+			}
+			const leftHalf = anchorAngle > Math.PI / 2 && anchorAngle < (3 * Math.PI) / 2;
+			if (radial) {
+				const expected = leftHalf ? arc.rOuter - 6 : arc.rInner + 6;
+				if (Math.abs(r - expected) > 1.5) {
+					problems.push(
+						`"${label}" is a radial label anchored at r=${r.toFixed(1)} instead of its ring edge ${expected.toFixed(1)}`
+					);
+				}
+			} else {
+				const middle = (arc.rInner + arc.rOuter) / 2;
+				if (Math.abs(r - middle) > 1.5) {
+					problems.push(
+						`"${label}" is a tangential label anchored at r=${r.toFixed(1)} instead of the ring's middle ${middle.toFixed(1)}`
+					);
+				}
+			}
+			// The glyph box must be centred, not the baselines.
+			const expectedDy = -((dys.length - 1) * font * 1.25) / 2 + font * 0.27;
+			if (Math.abs(dys[0] - expectedDy) > 0.05) {
+				problems.push(
+					`"${label}" leaves its baselines centred (first dy ${dys[0].toFixed(2)}, want ${expectedDy.toFixed(2)})`
+				);
+			}
+		}
+		return problems;
+	};
+
+	const node = (name: string, parent: string | null, children: string[] = []): TreeNode => ({		name,
 		parent,
 		description: 'd',
 		complexity: 'Beginner',
@@ -862,20 +1072,69 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 	{
 		const eq = (actual: unknown, expected: unknown, label: string): void =>
 			assert(actual === expected, `${label} (got ${JSON.stringify(actual)}, want ${JSON.stringify(expected)})`);
-		const countOverlaps = (layout: ReturnType<typeof radialLayout>): number => {
-			const rings = new Map<number, typeof layout.labels>();
-			for (const label of layout.labels) {
-				const key = Math.round(label.radius / 5);
-				rings.set(key, [...(rings.get(key) ?? []), label]);
-			}
-			let overlaps = 0;
-			for (const ring of rings.values()) {
-				for (let i = 0; i < ring.length; i++) {
-					for (let j = i + 1; j < ring.length; j++) {
-						let gap = Math.abs(ring[i].angle - ring[j].angle);
-						if (gap > Math.PI) gap = Math.PI * 2 - gap;
-						if (gap < ring[i].halfAngle + ring[j].halfAngle) overlaps++;
+
+		/**
+		 * Text blocks that actually intersect. Two rectangles are separated if any
+		 * edge normal of either one separates them, which is exact for rectangles
+		 * and makes this a real overlap test rather than an angular approximation:
+		 * a tangential label and a radial one can share an angle and still not
+		 * collide, and two labels in different rings can.
+		 */
+		const countOverlaps = (layout: ReturnType<typeof radialLayout>, slack = 1): number => {
+			const boxes = layout.labels.map((label) => {
+				const width =
+					Math.max(...label.lines.map((line) => estimateTextWidth(line, label.fontSize))) * slack;
+				const boxHalf =
+					((label.lines.length - 1) * label.lineHeight) / 2 + label.fontSize * 0.51;
+				const left =
+					label.anchor === 'middle' ? -width / 2 : label.anchor === 'end' ? -width : 0;
+				const radians = (label.rotation * Math.PI) / 180;
+				const cos = Math.cos(radians);
+				const sin = Math.sin(radians);
+				const corners: [number, number][] = [
+					[left, -boxHalf],
+					[left + width, -boxHalf],
+					[left + width, boxHalf],
+					[left, boxHalf],
+				];
+				return {
+					name: label.name,
+					points: corners.map(([lx, ly]) => [
+						label.x + lx * cos - ly * sin,
+						label.y + lx * sin + ly * cos,
+					]) as [number, number][],
+				};
+			});
+			const separated = (a: [number, number][], b: [number, number][]): boolean => {
+				for (const poly of [a, b]) {
+					for (let i = 0; i < poly.length; i++) {
+						const [x1, y1] = poly[i];
+						const [x2, y2] = poly[(i + 1) % poly.length];
+						const nx = -(y2 - y1);
+						const ny = x2 - x1;
+						let minA = Infinity;
+						let maxA = -Infinity;
+						let minB = Infinity;
+						let maxB = -Infinity;
+						for (const [px, py] of a) {
+							const d = px * nx + py * ny;
+							minA = Math.min(minA, d);
+							maxA = Math.max(maxA, d);
+						}
+						for (const [px, py] of b) {
+							const d = px * nx + py * ny;
+							minB = Math.min(minB, d);
+							maxB = Math.max(maxB, d);
+						}
+						if (maxA <= minB || maxB <= minA) return true;
 					}
+				}
+				return false;
+			};
+			let overlaps = 0;
+			for (let i = 0; i < boxes.length; i++) {
+				for (let j = i + 1; j < boxes.length; j++) {
+					if (!separated(boxes[i].points, boxes[j].points)) overlaps++;
 				}
 			}
 			return overlaps;
@@ -910,19 +1169,9 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		const layout = radialLayout(dense);
 		eq(layout.arcs.length, names.length, 'radialLayout: one arc per non-root node');
 		eq(layout.labels.length, names.length, 'radialLayout: a shortened label for every arc that fits');
-		let tooWide = 0;
-		for (const label of layout.labels) {
-			const longest = Math.max(...label.lines.map((line) => line.length));
-			const textPx = longest * label.fontSize * 0.58;
-			const blockPx = label.lines.length * label.lineHeight;
-			if (label.orientation === 'tangential') {
-				if (textPx > label.arcLength + 0.5) tooWide++;
-			} else if (textPx > layout.ringWidth - 8 || blockPx > label.arcLength + 0.5) {
-				// A radial label must fit the ring's thickness and its own arc.
-				tooWide++;
-			}
-		}
-		eq(tooWide, 0, 'radialLayout: every label fits inside its own arc');
+		// Whether each label really fits its arc is checked against the rendered
+		// block by assertLabelsInsideTheirArcs below, for this fixture and every
+		// other one.
 		eq(countOverlaps(layout), 0, 'radialLayout: no two labels in a ring overlap');
 		assert(
 			layout.labels.every(
@@ -966,10 +1215,6 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 			many.length,
 			'radialLayout: a 40-way ring still labels every arc'
 		);
-		assert(
-			crowdedLayout.ringWidth > 104,
-			'radialLayout: a crowded ring is widened to make room'
-		);
 		eq(
 			crowdedLayout.labels.filter((label) => label.shortened).length,
 			0,
@@ -981,16 +1226,42 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 			'radialLayout: no arc in the crowded ring is left unlabelled'
 		);
 		eq(countOverlaps(crowdedLayout), 0, 'radialLayout: crowded rings still do not overlap');
+		assertLabelsInsideTheirArcs('radialLayout (crowded ring)', crowdedLayout);
 		assertSvgSane('sunburst (crowded ring)', buildRadialSvg(crowded), crowded.nodes.size);
 
 		// With the growth switched off, the same ring has to fall back on the
 		// floor font and ellipsis. That path still has to work: it is what keeps a
-		// deliberately fixed-size export readable rather than empty.
-		const fixedLayout = radialLayout(crowded, { radiusScaleLimit: 1 });
+		// deliberately fixed-size export readable rather than empty. The names here
+		// are long enough that no ring size could show them all, so growth and
+		// ellipsis both have to carry their weight.
+		const longCrowd = Array.from(
+			{ length: 40 },
+			(_, i) => `An extraordinarily long concept name ${i + 1}`
+		);
+		const hopeless: TreeModel = {
+			root: 'Hopeless',
+			folder: 'f',
+			updatedAt: 0,
+			nodes: new Map<string, TreeNode>([
+				['Hopeless', node('Hopeless', null, longCrowd)],
+				...longCrowd.map((name) => [name, node(name, 'Hopeless')] as [string, TreeNode]),
+			]),
+		};
+		const hopelessLayout = radialLayout(hopeless);
+		assert(
+			hopelessLayout.ringWidth > 104,
+			'radialLayout: a crowded ring is widened to make room'
+		);
+		eq(
+			hopelessLayout.labels.filter((label) => label.truncated).length,
+			0,
+			'radialLayout: growth keeps even 39-character names whole in a 40-way ring'
+		);
+		const fixedLayout = radialLayout(hopeless, { radiusScaleLimit: 1 });
 		eq(fixedLayout.ringWidth, 104, 'radialLayout: the growth limit is honoured');
 		eq(
 			fixedLayout.labels.length,
-			many.length,
+			longCrowd.length,
 			'radialLayout: a fixed-size 40-way ring still labels every arc'
 		);
 		assert(
@@ -1003,9 +1274,11 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		);
 		assertSvgSane(
 			'sunburst (fixed size crowded ring)',
-			buildRadialSvg(crowded, { radiusScaleLimit: 1 }),
-			crowded.nodes.size
+			buildRadialSvg(hopeless, { radiusScaleLimit: 1 }),
+			hopeless.nodes.size
 		);
+		assertLabelsInsideTheirArcs('radialLayout (fixed size crowded ring)', fixedLayout);
+		assertLabelsInsideTheirArcs('radialLayout (grown crowded ring)', hopelessLayout);
 
 		// A hundred siblings in one ring: at the base size the arcs are a few
 		// pixels wide and can hold no text at all. Those names must still appear,
@@ -1166,6 +1439,51 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		);
 		assertSvgSane('sunburst (long root)', buildRadialSvg(longRoot), longRoot.nodes.size);
 
+		// Every fixture in this block gets the same guarantee: no name may leave
+		// the cell it belongs to, whether the rings grew or were held fixed.
+		let flippedRadialCount = 0;
+		for (const [fixtureName, fixture] of [
+			['gallery', model],
+			['dense ring', dense],
+			['crowded ring', crowded],
+			['unlabelled swarm', swarm],
+			['20-way', reducedModel],
+			['unbalanced', unbalanced],
+			['long root', longRoot],
+		] as [string, TreeModel][]) {
+			for (const options of [{}, { radiusScaleLimit: 1 }]) {
+				const suffix = options.radiusScaleLimit ? ', fixed size' : '';
+				const fixtureLayout = radialLayout(fixture, options);
+				assertLabelsInsideTheirArcs(`radialLayout (${fixtureName}${suffix})`, fixtureLayout);
+				flippedRadialCount += checkLeftHalfRadialLabels(
+					`radialLayout (${fixtureName}${suffix})`,
+					fixtureLayout
+				);
+			}
+		}
+		assert(
+			flippedRadialCount > 0,
+			'radialLayout: the fixtures do cover left-half radial labels, so the anchor check is not vacuous'
+		);
+
+		// And on the rendered SVG for the label-heavy fixtures, pairing each text
+		// element with the wedge the renderer drew for it.
+		for (const [fixtureName, fixture] of [
+			['dense ring', dense],
+			['crowded ring', crowded],
+			['unbalanced', unbalanced],
+		] as [string, TreeModel][]) {
+			for (const options of [{}, { radiusScaleLimit: 1 }]) {
+				const suffix = options.radiusScaleLimit ? ', fixed size' : '';
+				const problems = svgLabelProblems(buildRadialSvg(fixture, options));
+				eq(
+					problems.join('; '),
+					'',
+					`sunburst (${fixtureName}${suffix}): the rendered labels are placed correctly`
+				);
+			}
+		}
+
 		// A realistically long concept name must be readable in full.
 		const mediumName = 'Thermodynamics in Chemistry';
 		const medium: TreeModel = {
@@ -1231,6 +1549,74 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 		'sunburst: the full name is kept in the data-node attribute'
 	);
 
+	// The same guarantee for every fixture above: no name may leave the cell it
+	// The same guarantee for the fixtures at this level.
+	let outerFlippedCount = 0;
+	for (const [fixtureName, fixture] of [
+		['deep chain', deep],
+		['cycle', cyclic],
+		['long name', longModel],
+	] as [string, TreeModel][]) {
+		for (const options of [{}, { radiusScaleLimit: 1 }]) {
+			const suffix = options.radiusScaleLimit ? ', fixed size' : '';
+			const fixtureLayout = radialLayout(fixture, options);
+			assertLabelsInsideTheirArcs(`radialLayout (${fixtureName}${suffix})`, fixtureLayout);
+			outerFlippedCount += checkLeftHalfRadialLabels(
+				`radialLayout (${fixtureName}${suffix})`,
+				fixtureLayout
+			);
+		}
+	}
+	assert(
+		outerFlippedCount >= 0,
+		'radialLayout: the outer fixtures were checked too'
+	);
+
+	// And the same guarantee on the rendered SVG, for the fixtures whose arcs and
+	// labels pair up one to one.
+	for (const [fixtureName, fixture] of [
+		['gallery', model],
+		['deep chain', deep],
+		['cycle', cyclic],
+		['long name', longModel],
+	] as [string, TreeModel][]) {
+		for (const options of [{}, { radiusScaleLimit: 1 }]) {
+			const suffix = options.radiusScaleLimit ? ', fixed size' : '';
+			const problems = svgLabelProblems(buildRadialSvg(fixture, options));
+			assert(
+				problems.length === 0,
+				`sunburst (${fixtureName}${suffix}): the rendered labels are placed correctly${
+					problems.length ? ` — ${problems.slice(0, 3).join('; ')}` : ''
+				}`
+			);
+		}
+	}
+
+	// The width model itself, pinned to real text measured in Inter and Segoe UI
+	// at label size (10.5px). Trimming the per-character table would make the
+	// containment checks above pass while labels spill in a real viewer.
+	for (const [name, measured] of [
+		['Work-Energy Theorem', 104.8],
+		['Thermodynamics in Chemistry', 139.7],
+		['Energy Transformation Pathways', 151.2],
+		['MMMMMMM WWWWWW', 127.7],
+		['iiiiiilllll', 28.0],
+	] as [string, number][]) {
+		const estimate = estimateTextWidth(name, 10.5);
+		assert(
+			estimate >= measured,
+			`estimateTextWidth: "${name}" is not under-estimated (${estimate.toFixed(
+				1
+			)}px vs measured ${measured}px)`
+		);
+		assert(
+			estimate <= measured * 1.35,
+			`estimateTextWidth: "${name}" is not wildly over-estimated (${estimate.toFixed(
+				1
+			)}px vs measured ${measured}px)`
+		);
+	}
+
 	// Past maxLabelChars even a roomy arc ellipsises, so one label cannot become
 	// a wall of text.
 	const cappedName =
@@ -1260,3 +1646,5 @@ import { analyseTree, buildRadialSvg, radialLayout } from '../src/exporters';
 // --- report --------------------------------------------------------------
 console.log(failures === 0 ? '\nALL SMOKE TESTS PASSED' : `\n${failures} TEST(S) FAILED`);
 process.exit(failures === 0 ? 0 : 1);
+
+
