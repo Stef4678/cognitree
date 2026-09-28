@@ -11,7 +11,7 @@ import { computeDepths } from '../src/exporters';
 import { addCards, gradeCard, reviewStats } from '../src/review';
 import { buildGraph, collectVaultNotes, sourceMap } from '../src/vaultGraph';
 import CogniTreePlugin from '../src/main';
-import { VIEW_TYPE } from '../src/treeView';
+import { ConceptTreeView, VIEW_TYPE } from '../src/treeView';
 import { DEFAULT_SETTINGS, type DiscoveryResult, type TreeNode, type TreeModel } from '../src/types';
 
 let failures = 0;
@@ -714,11 +714,15 @@ async function main(): Promise<void> {
 					leaf.detached = true;
 				},
 			};
+			// Obsidian resolves getActiveViewOfType with `view instanceof type`, so a
+			// prototype-only instance stands in for a real view without any DOM.
+			leaf.view = Object.assign(Object.create(ConceptTreeView.prototype), { leaf });
 			return leaf;
 		};
 		const leaves: any[] = [];
 		const app: any = {
 			workspace: {
+				activeLeaf: null,
 				getLeavesOfType: (type: string) => leaves.filter((leaf) => leaf.type === type),
 				getRightLeaf: () => {
 					const leaf = makeLeaf();
@@ -726,6 +730,10 @@ async function main(): Promise<void> {
 					return leaf;
 				},
 				setActiveLeaf: () => undefined,
+				getActiveViewOfType: (type: any) => {
+					const view = app.workspace.activeLeaf?.view;
+					return view instanceof type ? view : null;
+				},
 			},
 		};
 		const plugin: any = Object.create(CogniTreePlugin.prototype);

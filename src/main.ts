@@ -312,8 +312,10 @@ export default class CogniTreePlugin extends Plugin {
 	closeExtraPanels(): number {
 		const leaves = this.app.workspace.getLeavesOfType(VIEW_TYPE);
 		if (leaves.length < 2) return 0;
-		const active = this.app.workspace.activeLeaf;
-		const keep = active && leaves.includes(active) ? active : leaves[0];
+		// `activeLeaf` is deprecated; the focused view is its documented replacement
+		// and it finds the panel wherever it is docked.
+		const focused = this.app.workspace.getActiveViewOfType(ConceptTreeView);
+		const keep = focused && leaves.includes(focused.leaf) ? focused.leaf : leaves[0];
 		let closed = 0;
 		for (const leaf of leaves) {
 			if (leaf === keep) continue;

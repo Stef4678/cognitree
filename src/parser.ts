@@ -100,7 +100,7 @@ export function extractJSON<T = unknown>(text: string): T | null {
 	const { candidates, tail } = scanJsonObjects(s);
 	const takeTail =
 		!!tail && (candidates.length === 0 || (tail.length > candidates[0].length && tail.includes(':')));
-	if (takeTail) candidates.unshift(tail!);
+	if (takeTail) candidates.unshift(tail);
 
 	for (const candidate of candidates) {
 		for (const attempt of jsonStrategies(candidate)) {
