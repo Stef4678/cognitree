@@ -49,26 +49,35 @@ function closingBrace(s: string, start: number): number {
 }
 
 /**
- * Every complete top-level `{…}` span in `s`, longest first (ties keep document
- * order). Longest-first means a full payload beats a schema skeleton the model
- * echoed first; spans that only look like objects (`{democracy}` in prose) are
- * returned too and simply fail to parse.
+ * Scan `s` for top-level `{…}` spans. `candidates` holds the complete ones,
+ * longest first (ties keep document order) — longest-first means a full payload
+ * beats a schema skeleton the model echoed first, and spans that only look like
+ * objects (`{democracy}` in prose) are included too and simply fail to parse.
+ * `tail` is set when the scan hits an unterminated `{`: everything from there on
+ * is one object the response was cut off inside, which the caller repairs.
  */
-export function balancedJsonObjects(s: string): string[] {
+export function scanJsonObjects(s: string): { candidates: string[]; tail: string | null } {
 	const found: { start: number; text: string }[] = [];
+	const sorted = () =>
+		found
+			.slice()
+			.sort((a, b) => b.text.length - a.text.length || a.start - b.start)
+			.map((f) => f.text);
 	let i = 0;
 	while (i < s.length) {
 		const start = s.indexOf('{', i);
 		if (start === -1) break;
 		const end = closingBrace(s, start);
-		if (end === -1) break; // unterminated tail — the caller repairs it
+		if (end === -1) return { candidates: sorted(), tail: s.slice(start) };
 		found.push({ start, text: s.slice(start, end + 1) });
 		i = end + 1;
 	}
-	return found
-		.slice()
-		.sort((a, b) => b.text.length - a.text.length || a.start - b.start)
-		.map((f) => f.text);
+	return { candidates: sorted(), tail: null };
+}
+
+/** The complete top-level `{…}` spans in `s`, longest first. */
+export function balancedJsonObjects(s: string): string[] {
+	return scanJsonObjects(s).candidates;
 }
 
 /** Strip markdown fences and trailing prose, then extract the first balanced JSON object. */
@@ -83,10 +92,15 @@ export function extractJSON<T = unknown>(text: string): T | null {
 	const start = s.indexOf('{');
 	if (start === -1) return null;
 
-	// Complete objects first; a truncated response (nothing balanced) falls
-	// back to the tail from the first `{` so jsonrepair can close it.
-	const candidates = balancedJsonObjects(s);
-	if (candidates.length === 0) candidates.push(s.slice(start));
+	// Complete objects first. A response cut off mid-object leaves the real payload
+	// unterminated, so it never joins the candidates and a balanced schema echo would
+	// win; take the repaired tail then. The `:` guard rejects a stray brace in prose
+	// (`{x}` mid-sentence, which repairs to a garbage `{"x":null}`) — a real payload,
+	// truncated or not, always carries a key by that point.
+	const { candidates, tail } = scanJsonObjects(s);
+	const takeTail =
+		!!tail && (candidates.length === 0 || (tail.length > candidates[0].length && tail.includes(':')));
+	if (takeTail) candidates.unshift(tail!);
 
 	for (const candidate of candidates) {
 		for (const attempt of jsonStrategies(candidate)) {

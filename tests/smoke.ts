@@ -127,6 +127,23 @@ by an object due to its motion.",
 
 	// The prompts demand an object; an array is never a valid result.
 	assert(extractJSON('[1, 2, 3]') === null, 'extractJSON: bare array stays null');
+
+	// Cut off mid-payload *after* a complete schema echo: the echoed skeleton is
+	// the only balanced object, so it must not win over the truncated real one.
+	const echoThenCut =
+		'Format: {"concept": "name", "domains": []}\nResult: ' +
+		'{"concept": "energy", "domains": [{"name": "Physics", "children": [{"name": "Kinetic Energy"';
+	const cut = extractJSON<{ concept: string; domains: { name: string }[] }>(echoThenCut);
+	assert(
+		cut?.concept === 'energy' && cut?.domains?.[0]?.name === 'Physics',
+		`extractJSON: a truncated payload beats the schema echo (got ${JSON.stringify(cut)})`
+	);
+
+	// A stray `{` in trailing prose is not a payload and must not displace one.
+	assert(
+		extractJSON<{ a: number }>('{"a": 1} then a stray { open brace')?.a === 1,
+		'extractJSON: an unterminated brace in prose does not win'
+	);
 }
 
 // --- repairMissingBraces --------------------------------------------------
@@ -735,6 +752,7 @@ import {
 // --- radial sunburst export ----------------------------------------------
 import {
 	analyseTree,
+	buildOutline,
 	buildRadialSvg,
 	buildTreeSvg,
 	estimateTextWidth,
@@ -1802,6 +1820,81 @@ import {
 	assert(
 		cappedSvg.includes(`data-node="${cappedName}"`),
 		'sunburst: the over-long name is still kept in the data-node attribute'
+	);
+}
+
+// --- layered SVG connectors + outline escaping ---------------------------
+{
+	const mk = (name: string, parent: string | null, children: string[] = []): TreeNode => ({
+		name,
+		parent,
+		description: 'd',
+		complexity: 'Beginner',
+		canExpand: true,
+		estimatedDepth: 3,
+		connections: [],
+		children,
+		path: `/${name.toLowerCase()}`,
+		created: 0,
+		file: `CogniTree/Root/${name}.md`,
+		treeRoot: 'Root',
+		expanded: false,
+		loading: false,
+	});
+	const model = (root: string, nodes: [string, TreeNode][]): TreeModel => ({
+		root,
+		folder: 'CogniTree/Root',
+		updatedAt: 0,
+		nodes: new Map<string, TreeNode>(nodes),
+	});
+
+	const svg = buildTreeSvg(
+		model('Root', [
+			['Root', mk('Root', null, ['Alpha'])],
+			['Alpha', mk('Alpha', 'Root', ['Beta'])],
+			['Beta', mk('Beta', 'Alpha', [])],
+		])
+	);
+	// Boxes are drawn at `x + PAD`; the connectors must start at the same centre.
+	const checkBox = (name: string, expectedEdges: number) => {
+		const box = new RegExp(
+			`<g data-node="${name}" transform="translate\\(([-\\d.]+), ([-\\d.]+)\\)">\\s*` +
+				'<rect width="([\\d.]+)" height="([\\d.]+)"'
+		).exec(svg);
+		assert(!!box, `layered svg: the "${name}" box is drawn`);
+		if (!box) return;
+		const centre = Number(box[1]) + Number(box[3]) / 2;
+		const bottom = Number(box[2]) + Number(box[4]);
+		const starts = [...svg.matchAll(/<path d="M ([-\d.]+) ([-\d.]+) C/g)].filter(
+			(p) => Math.abs(Number(p[2]) - bottom) < 0.01
+		);
+		assert(
+			starts.length === expectedEdges,
+			`layered svg: "${name}" has ${expectedEdges} outgoing connector(s) (got ${starts.length})`
+		);
+		for (const p of starts) {
+			assert(
+				Math.abs(Number(p[1]) - centre) < 0.1,
+				`layered svg: the "${name}" connector starts at the box centre (got ${p[1]}, want ${centre})`
+			);
+		}
+	};
+	checkBox('Root', 1);
+	checkBox('Alpha', 1);
+
+	// `sanitizeFileName` covers the filesystem, not the wikilink grammar.
+	const bracketed = 'Foo]] and [[Bar';
+	const outline = buildOutline(
+		model('Root', [
+			['Root', mk('Root', null, [bracketed])],
+			[bracketed, mk(bracketed, 'Root')],
+		])
+	);
+	assert((outline.match(/\[\[/g) ?? []).length === 2, 'outline: exactly one wikilink open per node');
+	assert((outline.match(/\]\]/g) ?? []).length === 2, 'outline: exactly one wikilink close per node');
+	assert(
+		!outline.includes(']] and [['),
+		`outline: a bracketed concept name cannot break the link (got "${outline.split('\n')[2]}")`
 	);
 }
 
