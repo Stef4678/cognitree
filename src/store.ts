@@ -26,7 +26,7 @@ import {
 } from './notebody';
 import { cachedFrontmatter } from './indexer';
 import { ApiError } from './api';
-import { REVIEW_DATA_VERSION, newReviewData, type ReviewData } from './review';
+import { REVIEW_DATA_VERSION, newReviewData, removeCard, type ReviewData } from './review';
 
 /** Options for `ConceptStore.writeNode`. */
 export interface WriteNodeOptions {
@@ -61,6 +61,25 @@ export class ConceptStore {
 	setBaseFolder(folder: string): void {
 		const f = (folder || 'CogniTree').replace(/^\/+|\/+$/g, '');
 		if (f) this._baseFolder = f;
+	}
+
+	/**
+	 * Tail of the write queue. Several callers share one `TreeModel` — batch
+	 * expansion runs three workers at once — and each takes its duplicate-name
+	 * snapshot at entry, so without serialisation two of them mint the same
+	 * concept (one note shadowed in the model, the other orphaned in the vault).
+	 * The chain is promise-based rather than a count so a rejected task cannot
+	 * strand the queue.
+	 */
+	private writeChain: Promise<unknown> = Promise.resolve();
+
+	private withWriteLock<T>(fn: () => Promise<T>): Promise<T> {
+		const result = this.writeChain.then(fn, fn);
+		this.writeChain = result.then(
+			() => undefined,
+			() => undefined
+		);
+		return result;
 	}
 
 	private treeFolder(rootName: string): string {
@@ -505,50 +524,59 @@ export class ConceptStore {
 		domainOverride?: string
 	): Promise<{ created: TreeNode[]; skipped: string[] }> {
 		this.setBaseFolder(baseFolder);
-		const now = Date.now();
-		const created: TreeNode[] = [];
-		const skipped: string[] = [];
-		const seen = new Set<string>([
-			normalizeKey(parent.name),
-			...parent.children.map(normalizeKey),
-			...[ ...knownNames.keys() ].map(normalizeKey),
-		]);
+		// Name allocation, folder creation and the note writes are one critical
+		// section: concurrent expansions share `knownNames`, so a second caller
+		// entering before the first registers its nodes would take a snapshot
+		// that cannot see them and create the same concept again.
+		return this.withWriteLock(async () => {
+			const now = Date.now();
+			const created: TreeNode[] = [];
+			const skipped: string[] = [];
+			const seen = new Set<string>([
+				normalizeKey(parent.name),
+				...parent.children.map(normalizeKey),
+				...[ ...knownNames.keys() ].map(normalizeKey),
+			]);
 
-		for (const child of children || []) {
-			const childName = titleTrim(child.name || '');
-			if (!childName) continue;
-			const key = normalizeKey(childName);
-			if (seen.has(key)) {
-				skipped.push(childName);
-				continue;
+			for (const child of children || []) {
+				const childName = titleTrim(child.name || '');
+				if (!childName) continue;
+				const key = normalizeKey(childName);
+				if (seen.has(key)) {
+					skipped.push(childName);
+					continue;
+				}
+				seen.add(key);
+				const node: TreeNode = {
+					name: childName,
+					parent: parent.name,
+					domain: domainOverride ?? parent.domain,
+					description: child.description || '',
+					complexity: normalizeComplexity(child.complexity),
+					canExpand: toBool(child.can_expand, true),
+					estimatedDepth: toInt(child.estimated_depth, 3),
+					connections: (child.connections || []).filter(Boolean),
+					children: [],
+					path: `${parent.path}/${slugify(childName)}`,
+					created: now,
+					file: '',
+					treeRoot: parent.treeRoot,
+					expanded: false,
+					loading: false,
+				};
+				parent.children.push(childName);
+				created.push(node);
 			}
-			seen.add(key);
-			const node: TreeNode = {
-				name: childName,
-				parent: parent.name,
-				domain: domainOverride ?? parent.domain,
-				description: child.description || '',
-				complexity: normalizeComplexity(child.complexity),
-				canExpand: toBool(child.can_expand, true),
-				estimatedDepth: toInt(child.estimated_depth, 3),
-				connections: (child.connections || []).filter(Boolean),
-				children: [],
-				path: `${parent.path}/${slugify(childName)}`,
-				created: now,
-				file: '',
-				treeRoot: parent.treeRoot,
-				expanded: false,
-				loading: false,
-			};
-			parent.children.push(childName);
-			created.push(node);
-		}
 
-		for (const node of created) {
-			node.file = await this.writeNode(node);
-		}
-		await this.writeNode(parent);
-		return { created, skipped };
+			for (const node of created) {
+				node.file = await this.writeNode(node);
+				// Publish under the lock so the next caller's snapshot sees it —
+				// registering after the lock is released would only move the race.
+				knownNames.set(node.name, node);
+			}
+			await this.writeNode(parent);
+			return { created, skipped };
+		});
 	}
 
 	/** Append a wikilink to a node note's Connections section. Returns false if already linked. */
@@ -618,7 +646,7 @@ export class ConceptStore {
 
 		// A moved note must not list a child that stayed behind.
 		for (const m of moved) {
-			const kept = m.children.filter((c) => movedNames.has(c) || target.nodes.has(c));
+			const kept = m.children.filter((c) => movedNames.has(c));
 			if (kept.length !== m.children.length) {
 				m.children = kept;
 				await this.writeNode(m);
@@ -630,8 +658,11 @@ export class ConceptStore {
 		for (const c of node.children) {
 			const k = normalizeKey(c);
 			if (have.has(k)) continue;
-			// Only keep children whose note now actually lives in the target tree.
-			if (movedNames.has(c) || target.nodes.has(c)) {
+			// Only a child whose note actually moved may be adopted: `target.nodes.has(c)`
+			// is precisely the *skip* condition (the concept stayed behind in the source
+			// tree), so accepting it here would list a concept under a second parent and
+			// contradict the source note's own `children` list.
+			if (movedNames.has(c)) {
 				targetNode.children.push(c);
 				have.add(k);
 			}
@@ -698,7 +729,21 @@ export class ConceptStore {
 		// Drop the whole subtree from the in-memory model, not just the root —
 		// otherwise the deleted descendants keep inflating the node count.
 		for (const node of nodes) model.nodes.delete(node.name);
+		// The review store is keyed by concept name and knows nothing about the
+		// model, so without this the session keeps serving cards for notes that
+		// no longer exist (and the due count never falls).
+		await this.pruneReviewCards(model.root, new Set(nodes.map((n) => n.name)));
 		return nodes.length;
+	}
+
+	/** Drop the review cards of concepts that are gone from the tree. */
+	private async pruneReviewCards(rootName: string, gone: Set<string>): Promise<void> {
+		const data = await this.loadReview(rootName);
+		let removed = 0;
+		for (const card of Object.values(data.cards)) {
+			if (gone.has(card.node) && removeCard(data, card.id)) removed++;
+		}
+		if (removed > 0) await this.saveReview(data);
 	}
 
 	/**

@@ -978,6 +978,16 @@ ${body}
 `;
 }
 
+/**
+ * A concept name rendered inside `[[…]]` or a heading. `sanitizeFileName` covers
+ * the filesystem, not the wikilink grammar, so a name carrying `[`/`]`/`|`/`#`/`^`
+ * (from the model, or a hand-edited `concept:`) would close the link early and
+ * corrupt the exported outline.
+ */
+function linkSafe(name: string): string {
+	return name.replace(/[[\]|#^]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 /** Indented [[wikilink]] outline of the whole tree. */
 export function buildOutline(model: TreeModel): string {
 	const lines: string[] = [];
@@ -987,11 +997,11 @@ export function buildOutline(model: TreeModel): string {
 		seen.add(name);
 		const node = model.nodes.get(name);
 		if (!node) return;
-		lines.push(`${'  '.repeat(depth)}- [[${node.name}]]`);
+		lines.push(`${'  '.repeat(depth)}- [[${linkSafe(node.name)}]]`);
 		for (const c of node.children) visit(c, depth + 1);
 	};
 	visit(model.root, 0);
-	return `# ${model.root}\n\n${lines.join('\n')}\n`;
+	return `# ${linkSafe(model.root)}\n\n${lines.join('\n')}\n`;
 }
 
 /** Compact JSON snapshot of the tree (name/parent/path/domain/metadata). */
@@ -1242,9 +1252,11 @@ export function buildTreeSvg(model: TreeModel): string {
 		for (const c of n.children) {
 			const to = layout.get(c);
 			if (!to) continue;
-			const x1 = from.x + from.w / 2;
+			// Boxes are drawn at `x + shiftX` (below); the connectors must use the
+			// same origin or every curve lands PAD to the left of its nodes.
+			const x1 = from.x + from.w / 2 + shiftX;
 			const y1 = from.y + from.label.h;
-			const x2 = to.x + to.w / 2;
+			const x2 = to.x + to.w / 2 + shiftX;
 			const y2 = to.y;
 			const my = (y1 + y2) / 2;
 			edges.push(

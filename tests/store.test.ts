@@ -324,6 +324,110 @@ async function main(): Promise<void> {
 		);
 	}
 
+	// ------------------------------------------------- merge: skipped concept stays single-parent
+	{
+		const app = makeApp();
+		const store = new ConceptStore(app);
+		const note = (name: string, tree: string, parent: string | null, children: string[]) =>
+			`---\nconcept: "${name}"\ntree: "${tree}"\n${parent ? `parent: "${parent}"\n` : ''}` +
+			`description: "d"\ncomplexity: "Beginner"\ncan_expand: true\nestimated_depth: 3\nconnections: []\n` +
+			`children: [${children.map((c) => `"${c}"`).join(', ')}]\npath: "/${name.toLowerCase()}"\n` +
+			`created: 2025-01-01T00:00:00.000Z\n---\n# ${name}\n`;
+		app.vault.folders.add('CogniTree');
+		for (const f of ['Alpha', 'Beta']) app.vault.folders.add(`CogniTree/${f}`);
+		// Tree "Alpha": Alpha → {AChild, Shared}
+		app.vault.files.set('CogniTree/Alpha/Alpha.md', note('Alpha', 'Alpha', null, ['AChild', 'Shared']));
+		app.vault.files.set('CogniTree/Alpha/AChild.md', note('AChild', 'Alpha', 'Alpha', []));
+		app.vault.files.set('CogniTree/Alpha/Shared.md', note('Shared', 'Alpha', 'Alpha', []));
+		// Tree "Beta": Beta → BOther → Shared — the shared concept sits *deeper*
+		// than the target root, so the absorb loop must not re-list it under Beta.
+		app.vault.files.set('CogniTree/Beta/Beta.md', note('Beta', 'Beta', null, ['BOther']));
+		app.vault.files.set('CogniTree/Beta/BOther.md', note('BOther', 'Beta', 'Beta', ['Shared']));
+		app.vault.files.set('CogniTree/Beta/Shared.md', note('Shared', 'Beta', 'BOther', []));
+
+		const alpha = (await store.loadTree('Alpha'))!;
+		const beta = (await store.loadTree('Beta'))!;
+		const res = await store.mergeSubtree(alpha, 'Alpha', beta, 'Beta');
+		assert(res.skipped.includes('Shared'), 'merge skips the concept the target already has');
+
+		const betaAfter = (await store.loadTree('Beta'))!;
+		const holders = [...betaAfter.nodes.values()]
+			.filter((n) => n.children.includes('Shared'))
+			.map((n) => n.name);
+		eq(
+			holders.join(', '),
+			'BOther',
+			`a skipped concept keeps exactly one parent (${holders.join(', ')})`
+		);
+		eq(betaAfter.nodes.get('Shared')!.parent, 'BOther', 'the concept note agrees with its parent');
+	}
+
+	// ------------------------------------------------- delete prunes review cards
+	{
+		const app = makeApp();
+		const store = new ConceptStore(app);
+		await store.createDiscoveryTree(DISCOVERY, 'CogniTree');
+		const model = (await store.loadTree('Democracy'))!;
+		const data = await store.loadReview('Democracy');
+		addCards(
+			data,
+			'Democracy',
+			[
+				{ question: 'What is a direct democracy?', answer: 'People vote directly.' },
+				{ question: 'What is a representative democracy?', answer: 'Elected representatives.' },
+			],
+			0
+		);
+		// One card per branch, so the deletion can be seen to be scoped.
+		const cardFiles = Object.keys(data.cards);
+		eq(cardFiles.length, 2, 'two cards are seeded for the tree');
+		data.cards[cardFiles[0]].node = 'Direct Democracy';
+		data.cards[cardFiles[1]].node = 'Representative Democracy';
+		data.states[cardFiles[0]] = gradeCard(undefined, 'good', cardFiles[0], 0);
+		await store.saveReview(data);
+
+		await store.deleteSubtree(model, 'Direct Democracy');
+
+		const after = await store.loadReview('Democracy');
+		const nodes = Object.values(after.cards).map((c) => c.node);
+		eq(after.cards[cardFiles[0]], undefined, 'the deleted branch’s card is dropped');
+		assert(
+			nodes.includes('Representative Democracy'),
+			'the untouched branch keeps its card'
+		);
+		eq(after.states[cardFiles[0]], undefined, 'the dropped card’s schedule goes with it');
+	}
+
+	// ------------------------------------------------- concurrent expansion
+	{
+		const app = makeApp();
+		const store = new ConceptStore(app);
+		await store.createDiscoveryTree(DISCOVERY, 'CogniTree');
+		const model = (await store.loadTree('Democracy'))!;
+		const shared = [{ name: 'Conservation of Energy', description: 'd' }];
+		// Two workers expanding different parents at once, as batch mode does.
+		const results = await Promise.all([
+			store.addChildren(model.nodes.get('Democracy')!, shared, 'CogniTree', model.nodes),
+			store.addChildren(model.nodes.get('Direct Democracy')!, shared, 'CogniTree', model.nodes),
+		]);
+		eq(
+			results[0].created.length + results[1].created.length,
+			1,
+			'the shared concept is minted once, not once per worker'
+		);
+		const holders = [...model.nodes.values()].filter((n) =>
+			n.children.includes('Conservation of Energy')
+		);
+		eq(holders.length, 1, `exactly one parent lists the concept (${holders.map((h) => h.name).join(', ')})`);
+		eq(
+			model.nodes.get('Conservation of Energy')!.parent,
+			holders[0].name,
+			'the model node agrees with the parent that lists it'
+		);
+		const files = [...app.vault.files.keys()].filter((p) => p.includes('Conservation of Energy'));
+		eq(files.length, 1, `only one note is written (${files.join(', ')})`);
+	}
+
 	// ---------------------------------------------------------------- deep dives
 	{
 		const app = makeApp();
